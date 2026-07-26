@@ -6,7 +6,6 @@
 [![Minecraft](https://img.shields.io/badge/Minecraft-1.21.11-brightgreen?style=flat-square&logo=minecraft&logoColor=white)](https://minecraft.net)
 [![Paper](https://img.shields.io/badge/Server-Paper-blue?style=flat-square)](https://papermc.io)
 [![Java](https://img.shields.io/badge/Java-21%2B-orange?style=flat-square&logo=openjdk&logoColor=white)](https://adoptium.net)
-[![Version](https://img.shields.io/badge/Version-1.0-purple?style=flat-square)]()
 
 ***
 ### Plugin made by imNikos.
