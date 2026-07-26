@@ -1,0 +1,10 @@
+name: CustomTeams
+version: 1.0
+main: com.imNikos.CustomTeamsPlugin
+api-version: '1.21'
+commands:
+  ct:
+    description: Core command for Custom Teams events.
+    usage: /ct [leave]
+    aliases: [customteams]
+    permission: customteams.admin

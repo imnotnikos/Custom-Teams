@@ -1,0 +1,10 @@
+# CustomTeams - Main Configuration
+
+settings:
+  # The gamemode players are put into when the event starts. (SURVIVAL or ADVENTURE)
+  gamemode-on-start: SURVIVAL
+  # If true, killing a player instantly restores full health and hunger to the killer
+  health-on-kill: false
+
+event:
+  max-teams: 16
