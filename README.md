@@ -1,4 +1,7 @@
+<img width="100" height="100" alt="CustomTeamsLogo" src="https://github.com/user-attachments/assets/706d3259-4de1-4fdc-982f-e7d3656b077e" /> 
+
 # Custom Teams - A Paper 1.21.11 Plugin
+
 
 [![Minecraft](https://img.shields.io/badge/Minecraft-1.21.11-brightgreen?style=flat-square&logo=minecraft&logoColor=white)](https://minecraft.net)
 [![Paper](https://img.shields.io/badge/Server-Paper-blue?style=flat-square)](https://papermc.io)
