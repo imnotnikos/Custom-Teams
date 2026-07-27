@@ -37,6 +37,7 @@ import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.inventory.ItemFlag;
 import io.papermc.paper.event.player.AsyncChatEvent;
@@ -52,8 +53,12 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.scoreboard.Criteria;
+import org.bukkit.scoreboard.DisplaySlot;
+import org.bukkit.scoreboard.Objective;
 import org.bukkit.scoreboard.Scoreboard;
 import org.bukkit.scoreboard.Team;
+import io.papermc.paper.scoreboard.numbers.NumberFormat;
 
 import java.io.File;
 import java.io.IOException;
@@ -73,9 +78,11 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     // everywhere (chat, nametag, tab list, wool marker, firework) is the lighter
     // shade. NamedTextColor.RED/AQUA/GREEN/YELLOW already ARE the light variants
     // in Minecraft's legacy color palette (§c/§b/§a/§e), so no custom RGB hacks
-    // are needed for the scoreboard team color.
+    // are needed for the scoreboard team color. RED's marker block is plain
+    // RED_WOOL/RED_DYE (rather than pink) per admin preference; every other
+    // team keeps its original marker material.
     public enum EventTeam {
-        RED("RED", NamedTextColor.RED, Material.PINK_WOOL, Material.PINK_DYE, Color.fromRGB(255, 85, 85)),
+        RED("RED", NamedTextColor.RED, Material.RED_WOOL, Material.RED_DYE, Color.fromRGB(255, 85, 85)),
         BLUE("BLUE", NamedTextColor.AQUA, Material.LIGHT_BLUE_WOOL, Material.LIGHT_BLUE_DYE, Color.fromRGB(85, 255, 255)),
         GREEN("GREEN", NamedTextColor.GREEN, Material.LIME_WOOL, Material.LIME_DYE, Color.fromRGB(85, 255, 85)),
         YELLOW("YELLOW", NamedTextColor.YELLOW, Material.YELLOW_WOOL, Material.YELLOW_DYE, Color.fromRGB(255, 255, 85));
@@ -118,11 +125,27 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     private boolean celebrationActive = false;
     private UUID countdownInitiator = null;
     private BukkitTask countdownTask = null;
+    // The admin who clicked "Start" for the currently running (or last-run) event.
+    // Unlike countdownInitiator (which is cleared once the countdown finishes),
+    // this stays set for the whole match so every participant's kit can be
+    // resolved against the host's kit selection.
+    private UUID eventHostId = null;
 
     // Toggles
     private GameMode targetGameMode = GameMode.SURVIVAL;
     private boolean healthOnKill = true;
     private boolean naturalRegenEnabled = true;
+
+    // New Game Options settings
+    private int startCountdownSeconds = 5;          // 0 / 5 / 10
+    private int inventoryManagementSeconds = 0;      // 0 / 5 / 10
+    private int spawnInvincibilitySeconds = 5;       // 0 / 5 / 10 (grace period right after spawning in)
+    private int celebrationSeconds = 10;             // 0 / 5 / 10
+    private boolean healthIndicatorEnabled = false;  // health under nametag
+    private boolean itemDropEnabled = true;          // item drops for participants
+    private boolean dropItemsOnDeath = true;          // whether death drops actually land on the ground
+
+    private Objective healthObjective;
 
     // Modes
     private EventMode queuedMode = null;   // what will run on next Start Event
@@ -136,6 +159,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
     private final Map<UUID, ItemStack[]> savedKitBuilderInventories = new HashMap<>();
     private final Map<UUID, GameMode> savedKitBuilderGameModes = new HashMap<>();
+    private final Map<UUID, Integer> editingKitNumber = new HashMap<>();
 
     // Teams mode
     private final Map<UUID, EventTeam> playerTeams = new HashMap<>();
@@ -147,19 +171,30 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     private Set<UUID> ffaPendingPlayers = new HashSet<>(); // finalized roster for the next FFA start
     private final Set<UUID> ffaPlayers = new HashSet<>();  // active participants while FFA is running
 
-    // Spectating / invincibility
+    // Spectating / invincibility / freeze
     private final Set<UUID> spectatingPlayers = new HashSet<>();
     private final Set<UUID> invinciblePlayers = new HashSet<>();
+    private final Set<UUID> frozenPlayers = new HashSet<>();
+
+    // Anti-flag-kick landing lock: while a participant is falling to their spawn's
+    // surface (feet not yet in contact with the ground), horizontal (X/Z) movement
+    // is pinned to the spawn column so they can't be flagged as flying/drifting.
+    // Removed automatically the instant Player#isOnGround() becomes true.
+    private final Map<UUID, double[]> spawnLandingLock = new HashMap<>();
+
+    private BukkitTask healthIndicatorTask = null;
 
     // Team spawn editing
     private final Set<UUID> teamSpawnEditMode = new HashSet<>();
     private final Map<UUID, Map<EventTeam, List<Location>>> teamSpawnBuffer = new HashMap<>();
+    private final Map<UUID, GameMode> teamSpawnEditPrevGameMode = new HashMap<>();
 
     // FFA spawn editing
     private final Set<UUID> ffaSpawnEditMode = new HashSet<>();
     private final Map<UUID, String> ffaSpawnEditType = new HashMap<>(); // "EXACT" or "RADIUS"
     private final Map<UUID, List<Location>> ffaExactSpawnBuffer = new HashMap<>();
     private final Map<UUID, Integer> ffaExactSpawnNeeded = new HashMap<>();
+    private final Map<UUID, GameMode> ffaSpawnEditPrevGameMode = new HashMap<>();
 
     private BossBar eventBossBar;
 
@@ -176,6 +211,13 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         targetGameMode = GameMode.valueOf(getConfig().getString("settings.gamemode-on-start", "SURVIVAL").toUpperCase());
         healthOnKill = getConfig().getBoolean("settings.health-on-kill", true);
         naturalRegenEnabled = getConfig().getBoolean("settings.natural-regen", true);
+        startCountdownSeconds = getConfig().getInt("settings.start-countdown", 5);
+        inventoryManagementSeconds = getConfig().getInt("settings.inventory-management-time", 0);
+        spawnInvincibilitySeconds = getConfig().getInt("settings.spawn-invincibility", 5);
+        celebrationSeconds = getConfig().getInt("settings.celebration-time", 10);
+        healthIndicatorEnabled = getConfig().getBoolean("settings.health-indicator", false);
+        itemDropEnabled = getConfig().getBoolean("settings.item-drop-enabled", true);
+        dropItemsOnDeath = getConfig().getBoolean("settings.drop-items-on-death", true);
 
         Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
         for (EventTeam team : EventTeam.values()) {
@@ -184,6 +226,11 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             sTeam.color(team.getScoreboardColor());
             sTeam.setOption(Team.Option.NAME_TAG_VISIBILITY, Team.OptionStatus.ALWAYS);
         }
+
+        Objective existingObjective = board.getObjective("ct_health");
+        healthObjective = existingObjective != null ? existingObjective
+                : board.registerNewObjective("ct_health", Criteria.DUMMY, Component.empty());
+        applyHealthIndicatorDisplay();
 
         getLogger().info("CustomTeams initialized successfully.");
     }
@@ -213,6 +260,59 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         try { kitsDb.save(kitsFile); } catch (IOException ignored) {}
     }
 
+    private void applyHealthIndicatorDisplay() {
+        if (healthObjective == null) return;
+        if (healthIndicatorEnabled && eventRunning) {
+            healthObjective.setDisplaySlot(DisplaySlot.BELOW_NAME);
+        } else {
+            healthObjective.setDisplaySlot(null);
+        }
+    }
+
+    /**
+     * Runs only while an event is live. Every tick-and-a-half it (re)writes a
+     * score for each active, non-spectating participant so only participating
+     * players ever show a heart/health readout below their nametag; anyone
+     * else (staff, spectators, players who left) simply has no score entry.
+     */
+    private void startHealthIndicatorTask() {
+        stopHealthIndicatorTask();
+        healthIndicatorTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (!eventRunning) { cancel(); return; }
+                if (!healthIndicatorEnabled || healthObjective == null) return;
+
+                Set<UUID> participants = currentMode == EventMode.FFA ? ffaPlayers : playerTeams.keySet();
+                for (UUID uuid : participants) {
+                    Player p = Bukkit.getPlayer(uuid);
+                    if (p == null || !p.isOnline()) continue;
+                    if (spectatingPlayers.contains(uuid)) {
+                        healthObjective.getScoreboard().resetScores(p);
+                        continue;
+                    }
+                    int hp = (int) Math.ceil(p.getHealth());
+                    var score = healthObjective.getScore(p.getName());
+                    score.setScore(hp);
+                    score.numberFormat(NumberFormat.fixed(Component.text("\u2665 " + hp).color(NamedTextColor.RED)));
+                }
+            }
+        }.runTaskTimer(this, 0L, 10L);
+    }
+
+    private void stopHealthIndicatorTask() {
+        if (healthIndicatorTask != null) {
+            healthIndicatorTask.cancel();
+            healthIndicatorTask = null;
+        }
+    }
+
+    private int cycleTime(int current) {
+        if (current <= 0) return 5;
+        if (current == 5) return 10;
+        return 0;
+    }
+
     // ==========================================
     // Commands
     // ==========================================
@@ -236,7 +336,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         }
 
         if (args[0].equalsIgnoreCase("kits")) {
-            openPersonalKitsGUI(player);
+            openPlayerKitChoiceGUI(player);
             return true;
         }
 
@@ -268,11 +368,17 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             admin.sendMessage(Component.text("No FFA participants or team assignments have been set up yet.").color(NamedTextColor.RED));
             return;
         }
+
+        if (startCountdownSeconds <= 0) {
+            startEvent(admin);
+            return;
+        }
+
         countdownActive = true;
         countdownInitiator = admin.getUniqueId();
 
         countdownTask = new BukkitRunnable() {
-            int count = 5;
+            int count = startCountdownSeconds;
             @Override
             public void run() {
                 if (count > 0) {
@@ -307,7 +413,11 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         eventRunning = true;
         currentMode = queuedMode;
         celebrationActive = false;
+        eventHostId = admin.getUniqueId();
+        applyHealthIndicatorDisplay();
+        startHealthIndicatorTask();
         Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
+        List<Player> startedPlayers = new ArrayList<>();
 
         if (currentMode == EventMode.FFA) {
             List<Location> spawns = resolveFfaSpawns(ffaPendingPlayers.size());
@@ -324,17 +434,36 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 preEventGameModes.put(uuid, p.getGameMode());
                 preEventLocations.put(uuid, p.getLocation());
 
-                if (idx < spawns.size()) p.teleport(spawns.get(idx));
+                if (idx < spawns.size()) {
+                    Location spawnLoc = spawns.get(idx);
+                    p.teleport(spawnLoc);
+                    spawnLandingLock.put(uuid, new double[]{spawnLoc.getX(), spawnLoc.getZ()});
+                }
                 idx++;
 
                 setupCommonMatchState(p);
                 p.playerListName(Component.text(p.getName()).color(NamedTextColor.WHITE));
                 giveKit(p);
                 eventBossBar.addPlayer(p);
-                grantInvincibility(p, 5);
-                p.sendMessage(Component.text("\n\n★ THE EVENT HAS STARTED! ★\n\n").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
+                startedPlayers.add(p);
             }
         } else {
+            Map<EventTeam, List<Player>> rosterByTeam = new EnumMap<>(EventTeam.class);
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                EventTeam team = playerTeams.get(p.getUniqueId());
+                if (team != null) rosterByTeam.computeIfAbsent(team, k -> new ArrayList<>()).add(p);
+            }
+
+            Map<UUID, Location> teamSpawnAssignments = new HashMap<>();
+            for (Map.Entry<EventTeam, List<Player>> entry : rosterByTeam.entrySet()) {
+                List<Location> spawns = getTeamSpawnPoints(entry.getKey());
+                if (spawns.isEmpty()) {
+                    admin.sendMessage(Component.text("Warning: No spawn points set for " + entry.getKey().getDisplayName()).color(NamedTextColor.RED));
+                    continue;
+                }
+                teamSpawnAssignments.putAll(assignTeamSpawns(entry.getValue(), spawns));
+            }
+
             for (Player p : Bukkit.getOnlinePlayers()) {
                 EventTeam team = playerTeams.get(p.getUniqueId());
                 if (team == null) continue;
@@ -343,11 +472,10 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 preEventGameModes.put(p.getUniqueId(), p.getGameMode());
                 preEventLocations.put(p.getUniqueId(), p.getLocation());
 
-                Location spawn = getRandomTeamSpawn(team);
+                Location spawn = teamSpawnAssignments.get(p.getUniqueId());
                 if (spawn != null) {
                     p.teleport(spawn);
-                } else {
-                    admin.sendMessage(Component.text("Warning: No spawn points set for " + team.getDisplayName()).color(NamedTextColor.RED));
+                    spawnLandingLock.put(p.getUniqueId(), new double[]{spawn.getX(), spawn.getZ()});
                 }
 
                 setupCommonMatchState(p);
@@ -358,12 +486,51 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
                 giveKit(p);
                 eventBossBar.addPlayer(p);
-                grantInvincibility(p, 5);
-                p.sendMessage(Component.text("\n\n★ THE EVENT HAS STARTED! ★\n\n").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
+                startedPlayers.add(p);
             }
         }
 
+        beginMatchSequence(startedPlayers);
         updateGameState();
+    }
+
+    /**
+     * Handles the transition from "kit given" to "match live". If an inventory
+     * management window is configured, participants are frozen in place (but
+     * fully invincible) so they can rearrange their kit before the match
+     * actually begins; otherwise the match starts immediately. Either way, the
+     * post-spawn invincibility/no-damage grace period uses the configurable
+     * spawn-invincibility timer (0/5/10s), same as the other event timers.
+     */
+    private void beginMatchSequence(List<Player> participants) {
+        if (inventoryManagementSeconds > 0) {
+            for (Player p : participants) {
+                UUID id = p.getUniqueId();
+                frozenPlayers.add(id);
+                invinciblePlayers.add(id);
+                p.showTitle(Title.title(
+                        Component.text("Manage Your Kit!").color(NamedTextColor.AQUA).decorate(TextDecoration.BOLD),
+                        Component.text("The match begins in " + inventoryManagementSeconds + " seconds...").color(NamedTextColor.GRAY)));
+            }
+
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                for (Player p : participants) {
+                    UUID id = p.getUniqueId();
+                    frozenPlayers.remove(id);
+                    invinciblePlayers.remove(id);
+                    p.sendMessage(Component.text("\n\n★ THE EVENT HAS STARTED! ★\n\n").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
+                    p.showTitle(Title.title(
+                            Component.text("FIGHT!").color(NamedTextColor.RED).decorate(TextDecoration.BOLD),
+                            Component.empty()));
+                    grantInvincibility(p, spawnInvincibilitySeconds);
+                }
+            }, inventoryManagementSeconds * 20L);
+        } else {
+            for (Player p : participants) {
+                grantInvincibility(p, spawnInvincibilitySeconds);
+                p.sendMessage(Component.text("\n\n★ THE EVENT HAS STARTED! ★\n\n").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
+            }
+        }
     }
 
     private void setupCommonMatchState(Player p) {
@@ -372,6 +539,13 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         p.setSaturation(10.0f);
         p.clearActivePotionEffects();
         p.setGameMode(targetGameMode);
+        // Explicitly drop any leftover flight state from Creative (kit editor / spawn
+        // editor) so survival/adventure players never re-enter with allowFlight still
+        // true - a common cause of anti-cheat "flying" kicks right after a teleport.
+        p.setAllowFlight(false);
+        p.setFlying(false);
+        p.setFallDistance(0f);
+        p.setVelocity(p.getVelocity().zero());
         spectatingPlayers.remove(p.getUniqueId());
         deathLocations.remove(p.getUniqueId());
     }
@@ -386,13 +560,19 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         eventBossBar.removeAll();
 
         Set<UUID> participants = currentMode == EventMode.FFA ? new HashSet<>(ffaPlayers) : new HashSet<>(playerTeams.keySet());
+        Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
         for (UUID uuid : participants) {
             Player p = Bukkit.getPlayer(uuid);
             if (p != null) {
                 p.clearTitle();
                 restorePlayerToPreEventState(p);
+                board.resetScores(p);
             }
+            spawnLandingLock.remove(uuid);
         }
+
+        stopHealthIndicatorTask();
+        applyHealthIndicatorDisplay();
 
         preEventInventories.clear();
         preEventGameModes.clear();
@@ -400,8 +580,10 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         deathLocations.clear();
         spectatingPlayers.clear();
         invinciblePlayers.clear();
+        frozenPlayers.clear();
         ffaPlayers.clear();
         currentMode = null;
+        eventHostId = null;
     }
 
     private void handleLeaveEvent(Player player) {
@@ -421,6 +603,9 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         spectatingPlayers.remove(id);
         deathLocations.remove(id);
         invinciblePlayers.remove(id);
+        frozenPlayers.remove(id);
+        spawnLandingLock.remove(id);
+        if (healthObjective != null) Bukkit.getScoreboardManager().getMainScoreboard().resetScores(player);
         eventBossBar.removePlayer(player);
         updateGameState();
 
@@ -471,6 +656,11 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         if (!isParticipant(victim.getUniqueId())) return;
 
         deathLocations.put(victim.getUniqueId(), victim.getLocation());
+        spawnLandingLock.remove(victim.getUniqueId());
+
+        if (!dropItemsOnDeath) {
+            e.getDrops().clear();
+        }
 
         Player killer = victim.getKiller();
         if (killer != null && isParticipant(killer.getUniqueId())) {
@@ -572,16 +762,24 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     }
 
     /**
-     * Runs the 10-second victory celebration. Winners (or everyone, on a draw)
-     * are made invincible and unable to damage anything for its duration, and
-     * fireworks spawn on the winning side each second until the event ends.
+     * Runs the victory celebration for the configured celebration-time window.
+     * Winners (or everyone, on a draw) are made invincible and unable to
+     * damage anything for its duration, and fireworks spawn on the winning
+     * side each second until the event ends. A celebration time of 0 skips
+     * the fireworks entirely and ends the event immediately.
      */
     private void startCelebration(Set<UUID> winnerIds, EventTeam winnerTeamColor, Set<UUID> allParticipantsSnapshot) {
         Set<UUID> fireworkTargets = winnerIds.isEmpty() ? new HashSet<>(allParticipantsSnapshot) : winnerIds;
+        int totalTicks = celebrationSeconds * 20;
+
+        if (totalTicks <= 0) {
+            endEvent();
+            return;
+        }
 
         for (UUID uuid : fireworkTargets) {
             Player p = Bukkit.getPlayer(uuid);
-            if (p != null) grantInvincibility(p, 10);
+            if (p != null) grantInvincibility(p, celebrationSeconds);
         }
 
         new BukkitRunnable() {
@@ -590,7 +788,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             public void run() {
                 if (!eventRunning) { cancel(); return; }
 
-                if (ticksElapsed < 200) {
+                if (ticksElapsed < totalTicks) {
                     for (UUID uuid : fireworkTargets) {
                         Player p = Bukkit.getPlayer(uuid);
                         if (p != null) spawnVictoryFirework(p.getLocation().add(0, 1, 0), winnerTeamColor);
@@ -621,6 +819,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     // ==========================================
 
     private void grantInvincibility(Player p, int seconds) {
+        if (seconds <= 0) return;
         UUID id = p.getUniqueId();
         invinciblePlayers.add(id);
         Bukkit.getScheduler().runTaskLater(this, () -> invinciblePlayers.remove(id), seconds * 20L);
@@ -653,6 +852,56 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         }
     }
 
+    /**
+     * Keeps a player pinned in place (during the inventory-management window,
+     * or right after spawning in) WITHOUT ever holding them above the ground.
+     * While the player is not yet on solid ground, only X/Z drift is blocked -
+     * gravity is left completely alone so they fall naturally to the surface.
+     * Only once Player#isOnGround() is true do we also lock Y (for frozen
+     * players) or release the lock entirely (for players just settling into
+     * their spawn). This is what prevents anti-cheat "flying" kicks: the
+     * player is never held motionless while airborne.
+     */
+    @EventHandler
+    public void onPlayerMove(PlayerMoveEvent e) {
+        Player p = e.getPlayer();
+        UUID id = p.getUniqueId();
+        Location to = e.getTo();
+        if (to == null) return;
+
+        boolean settlingAfterSpawn = spawnLandingLock.containsKey(id);
+        boolean frozen = frozenPlayers.contains(id);
+        if (!settlingAfterSpawn && !frozen) return;
+
+        if (!p.isOnGround()) {
+            // Still airborne (falling to the ground): never restrict Y, only
+            // keep them from drifting sideways while gravity does its job.
+            double[] lock = spawnLandingLock.computeIfAbsent(id,
+                    k -> new double[]{p.getLocation().getX(), p.getLocation().getZ()});
+            if (to.getX() != lock[0] || to.getZ() != lock[1]) {
+                Location corrected = to.clone();
+                corrected.setX(lock[0]);
+                corrected.setZ(lock[1]);
+                e.setTo(corrected);
+            }
+            return;
+        }
+
+        // Feet are now confirmed touching solid ground.
+        spawnLandingLock.remove(id);
+
+        if (frozen) {
+            Location from = e.getFrom();
+            if (from.getWorld() == null) return;
+            if (from.getX() != to.getX() || from.getY() != to.getY() || from.getZ() != to.getZ()) {
+                Location locked = from.clone();
+                locked.setYaw(to.getYaw());
+                locked.setPitch(to.getPitch());
+                e.setTo(locked);
+            }
+        }
+    }
+
     // ==========================================
     // GUIs
     // ==========================================
@@ -660,20 +909,10 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     private void openMainGUI(Player player) {
         Inventory inv = Bukkit.createInventory(null, 27, Component.text("Custom Teams Settings").color(NamedTextColor.DARK_GRAY));
 
-        inv.setItem(11, createGuiItem(Material.LEATHER_CHESTPLATE, Component.text("Teams").color(NamedTextColor.AQUA), "Manage event teams."));
-        inv.setItem(13, createGuiItem(Material.COMPASS, Component.text("Spawns").color(NamedTextColor.LIGHT_PURPLE), "Set spawn points."));
-        inv.setItem(15, createGuiItem(Material.DIAMOND_SWORD, Component.text("Kit Creator").color(NamedTextColor.GOLD), "Design the master kit."));
-
-        Material gmMat = targetGameMode == GameMode.SURVIVAL ? Material.IRON_PICKAXE : Material.MAP;
-        inv.setItem(24, createGuiItem(gmMat, Component.text("Gamemode: " + targetGameMode.name()).color(NamedTextColor.YELLOW), "Click to toggle Survival/Adventure."));
-
-        Material regenMat = naturalRegenEnabled ? Material.GOLDEN_CARROT : Material.ROTTEN_FLESH;
-        NamedTextColor regenColor = naturalRegenEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
-        inv.setItem(25, createGuiItem(regenMat, Component.text("Natural Regen: " + (naturalRegenEnabled ? "ON" : "OFF")).color(regenColor), "Click to toggle natural regen for event participants only."));
-
-        Material hokMat = healthOnKill ? Material.GOLDEN_APPLE : Material.APPLE;
-        NamedTextColor hokColor = healthOnKill ? NamedTextColor.GREEN : NamedTextColor.RED;
-        inv.setItem(26, createGuiItem(hokMat, Component.text("Health on Kill: " + (healthOnKill ? "ON" : "OFF")).color(hokColor), "Click to toggle."));
+        inv.setItem(10, createGuiItem(Material.LEATHER_CHESTPLATE, Component.text("Teams").color(NamedTextColor.AQUA), "Manage event teams."));
+        inv.setItem(12, createGuiItem(Material.COMPASS, Component.text("Spawns").color(NamedTextColor.LIGHT_PURPLE), "Set spawn points."));
+        inv.setItem(14, createGuiItem(Material.DIAMOND_SWORD, Component.text("My Kits").color(NamedTextColor.GOLD), "Build and choose your own 3 kits.", "(Same as /ct kits. Only the event", "host's kit is actually used in-match.)"));
+        inv.setItem(16, createGuiItem(Material.COMMAND_BLOCK, Component.text("Game Options").color(NamedTextColor.YELLOW), "Gamemode, timers, and toggles."));
 
         if (eventRunning) {
             inv.setItem(22, createGuiItem(Material.RED_WOOL, Component.text("Force End Event").color(NamedTextColor.RED).decorate(TextDecoration.BOLD)));
@@ -687,12 +926,83 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         player.openInventory(inv);
     }
 
+    private void openGameOptionsGUI(Player player) {
+        Inventory inv = Bukkit.createInventory(null, 27, Component.text("Game Options").color(NamedTextColor.DARK_GRAY));
+
+        Material gmMat = targetGameMode == GameMode.SURVIVAL ? Material.IRON_PICKAXE : Material.MAP;
+        inv.setItem(10, createGuiItem(gmMat, Component.text("Gamemode: " + targetGameMode.name()).color(NamedTextColor.YELLOW), "Click to toggle Survival/Adventure."));
+
+        Material regenMat = naturalRegenEnabled ? Material.GOLDEN_CARROT : Material.ROTTEN_FLESH;
+        NamedTextColor regenColor = naturalRegenEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(11, createGuiItem(regenMat, Component.text("Natural Regen: " + (naturalRegenEnabled ? "ON" : "OFF")).color(regenColor), "Click to toggle natural regen for event participants only."));
+
+        Material hokMat = healthOnKill ? Material.GOLDEN_APPLE : Material.APPLE;
+        NamedTextColor hokColor = healthOnKill ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(12, createGuiItem(hokMat, Component.text("Health on Kill: " + (healthOnKill ? "ON" : "OFF")).color(hokColor), "Click to toggle."));
+
+        inv.setItem(14, createGuiItem(Material.CLOCK, Component.text("Start Countdown: " + startCountdownSeconds + "s").color(NamedTextColor.AQUA), "Click to cycle: 0 / 5 / 10 seconds."));
+        inv.setItem(15, createGuiItem(Material.ENDER_CHEST, Component.text("Inventory Management: " + inventoryManagementSeconds + "s").color(NamedTextColor.LIGHT_PURPLE), "Freeze players to manage their kit", "before the match truly begins.", "Click to cycle: 0 / 5 / 10 seconds."));
+        inv.setItem(16, createGuiItem(Material.FIREWORK_ROCKET, Component.text("Celebration Time: " + celebrationSeconds + "s").color(NamedTextColor.GOLD), "Click to cycle: 0 / 5 / 10 seconds."));
+
+        Material healthMat = healthIndicatorEnabled ? Material.BEETROOT : Material.GRAY_DYE;
+        NamedTextColor healthColor = healthIndicatorEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(19, createGuiItem(healthMat, Component.text("Health Indicator: " + (healthIndicatorEnabled ? "ON" : "OFF")).color(healthColor), "Shows health under nametags.", "Click to toggle."));
+
+        Material dropMat = itemDropEnabled ? Material.HOPPER : Material.BARRIER;
+        NamedTextColor dropColor = itemDropEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(20, createGuiItem(dropMat, Component.text("Item Drops: " + (itemDropEnabled ? "ON" : "OFF")).color(dropColor), "Click to toggle item dropping", "for event participants."));
+
+        Material deathDropMat = dropItemsOnDeath ? Material.CHEST : Material.BARRIER;
+        NamedTextColor deathDropColor = dropItemsOnDeath ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(22, createGuiItem(deathDropMat, Component.text("Death Drops: " + (dropItemsOnDeath ? "ON" : "OFF")).color(deathDropColor),
+                "Click to toggle whether a participant's", "items land on the ground when they die.",
+                "(They still lose the items either way -", "this only controls if they're dropped.)"));
+
+        inv.setItem(21, createGuiItem(Material.SHIELD, Component.text("Spawn Invincibility: " + spawnInvincibilitySeconds + "s").color(NamedTextColor.AQUA), "Grace period after spawning in", "(and after kit management, if any)", "where players can't take or deal damage.", "Click to cycle: 0 / 5 / 10 seconds."));
+
+        inv.setItem(26, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
+        player.openInventory(inv);
+    }
+
     private void openTeamsMenuGUI(Player player) {
         Inventory inv = Bukkit.createInventory(null, 27, Component.text("Team Management").color(NamedTextColor.DARK_GRAY));
+
+        EventMode displayMode = queuedMode != null ? queuedMode : EventMode.FFA;
+        Material modeMat = displayMode == EventMode.FFA ? Material.IRON_SWORD : Material.SHIELD;
+        inv.setItem(4, createGuiItem(modeMat, Component.text("Game Type: " + displayMode.name()).color(NamedTextColor.YELLOW).decorate(TextDecoration.BOLD),
+                "The mode that will run on the next Start Event.", "Click to switch between FFA and Teams."));
+
         inv.setItem(11, createGuiItem(Material.IRON_SWORD, Component.text("Free-For-All (FFA)").color(NamedTextColor.RED), "Select players and each fights solo."));
-        inv.setItem(15, createGuiItem(Material.WHITE_WOOL, Component.text("Manual Teams").color(NamedTextColor.GREEN), "Select a color and assign players manually."));
+        inv.setItem(14, createGuiItem(Material.WHITE_WOOL, Component.text("Manual Teams").color(NamedTextColor.GREEN), "Select a color and assign players manually."));
+        inv.setItem(15, createGuiItem(Material.NETHER_STAR, Component.text("Autofill Teams").color(NamedTextColor.LIGHT_PURPLE),
+                "Randomly spreads all online players", "evenly across the 4 teams.", "Shuffles differently every time."));
         inv.setItem(22, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
         player.openInventory(inv);
+    }
+
+    /**
+     * Randomly (and differently each time) spreads every online player across
+     * the 4 team colors as evenly as possible, replacing any existing manual
+     * team assignments.
+     */
+    private void autofillTeams(Player admin) {
+        List<Player> online = new ArrayList<>(Bukkit.getOnlinePlayers());
+        Collections.shuffle(online);
+
+        playerTeams.clear();
+        EventTeam[] teams = EventTeam.values();
+        for (int i = 0; i < online.size(); i++) {
+            playerTeams.put(online.get(i).getUniqueId(), teams[i % teams.length]);
+        }
+
+        queuedMode = EventMode.TEAMS;
+
+        for (Player p : online) {
+            EventTeam team = playerTeams.get(p.getUniqueId());
+            p.sendMessage(Component.text("You were autofilled onto team: ").color(NamedTextColor.GRAY)
+                    .append(Component.text(team.getDisplayName()).color(team.getScoreboardColor()).decorate(TextDecoration.BOLD)));
+        }
+        admin.sendMessage(Component.text("Teams autofilled with " + online.size() + " players!").color(NamedTextColor.GREEN));
     }
 
     private void openFFASelectGUI(Player player, int page) {
@@ -772,18 +1082,21 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         player.openInventory(inv);
     }
 
-    private void openKitCreatorGUI(Player player) {
+    // ---------- Kit Creator (each player builds their own 3 kits) ----------
+
+    private void openMasterKitEditorGUI(Player player, int kitNumber) {
         if (player.getGameMode() != GameMode.CREATIVE) {
             savedKitBuilderInventories.put(player.getUniqueId(), player.getInventory().getContents());
             savedKitBuilderGameModes.put(player.getUniqueId(), player.getGameMode());
             player.getInventory().clear();
             player.setGameMode(GameMode.CREATIVE);
         }
+        editingKitNumber.put(player.getUniqueId(), kitNumber);
 
-        Inventory inv = Bukkit.createInventory(null, 54, Component.text("Master Kit Creator").color(NamedTextColor.DARK_GRAY));
+        Inventory inv = Bukkit.createInventory(null, 54, Component.text("Master Kit Creator - Kit " + kitNumber).color(NamedTextColor.DARK_GRAY));
 
         @SuppressWarnings("unchecked")
-        List<ItemStack> existingKit = (List<ItemStack>) kitsDb.getList("kits.active");
+        List<ItemStack> existingKit = (List<ItemStack>) kitsDb.getList("playerkits." + player.getUniqueId() + ".kit" + kitNumber);
         if (existingKit != null && existingKit.size() == 54) {
             for (int i = 0; i < 54; i++) {
                 if (existingKit.get(i) != null) inv.setItem(i, existingKit.get(i));
@@ -800,10 +1113,52 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             if (inv.getItem(i) == null) inv.setItem(i, createGuiItem(Material.MAGENTA_STAINED_GLASS_PANE, Component.text("Potion Effect").color(NamedTextColor.LIGHT_PURPLE)));
         }
 
-        inv.setItem(17, createGuiItem(Material.EMERALD_BLOCK, Component.text("SAVE EVENT KIT").color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD)));
+        inv.setItem(17, createGuiItem(Material.EMERALD_BLOCK, Component.text("SAVE KIT " + kitNumber).color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD)));
 
         player.openInventory(inv);
-        player.sendMessage(Component.text("Place items in the slots. Click a stained glass pane with an item to swap it in. Click Emerald Block to save!").color(NamedTextColor.AQUA));
+        player.sendMessage(Component.text("Editing Kit " + kitNumber + ". Place items in the slots. Click a stained glass pane with an item to swap it in. Click Emerald Block to save!").color(NamedTextColor.AQUA));
+    }
+
+    private void saveKitFromGUI(Player player, Inventory gui, int kitNumber) {
+        List<ItemStack> kitToSave = new ArrayList<>(Arrays.asList(gui.getContents()));
+        for (int i = 0; i < 18; i++) {
+            ItemStack item = kitToSave.get(i);
+            if (item != null && (item.getType().name().contains("GLASS_PANE") || item.getType() == Material.EMERALD_BLOCK)) {
+                kitToSave.set(i, null);
+            }
+        }
+        kitsDb.set("playerkits." + player.getUniqueId() + ".kit" + kitNumber, kitToSave);
+        saveKitsDatabase();
+        player.sendMessage(Component.text("Kit " + kitNumber + " saved!").color(NamedTextColor.GREEN));
+    }
+
+    // ---------- Player kits (each player builds and chooses among their own 3 kits) ----------
+
+    private void openPlayerKitChoiceGUI(Player player) {
+        Inventory inv = Bukkit.createInventory(null, 27, Component.text("My Kits").color(NamedTextColor.DARK_GRAY));
+        int choice = kitsDb.getInt("playerkits." + player.getUniqueId() + ".choice", 1);
+
+        ItemStack kit1 = createGuiItem(Material.DIAMOND_CHESTPLATE, Component.text("Kit 1").color(NamedTextColor.AQUA),
+                choice == 1 ? "SELECTED" : "Left-click to select this kit.", "Right-click to edit this kit.");
+        ItemStack kit2 = createGuiItem(Material.GOLDEN_CHESTPLATE, Component.text("Kit 2").color(NamedTextColor.GOLD),
+                choice == 2 ? "SELECTED" : "Left-click to select this kit.", "Right-click to edit this kit.");
+        ItemStack kit3 = createGuiItem(Material.IRON_CHESTPLATE, Component.text("Kit 3").color(NamedTextColor.GRAY),
+                choice == 3 ? "SELECTED" : "Left-click to select this kit.", "Right-click to edit this kit.");
+        // (Selected kit keeps its enchant glint below; right-click still edits it too.)
+
+        ItemStack selectedItem = choice == 1 ? kit1 : (choice == 2 ? kit2 : kit3);
+        ItemMeta meta = selectedItem.getItemMeta();
+        if (meta != null) {
+            meta.addEnchant(Enchantment.UNBREAKING, 1, true);
+            meta.addItemFlags(ItemFlag.HIDE_ENCHANTS);
+            selectedItem.setItemMeta(meta);
+        }
+
+        inv.setItem(11, kit1);
+        inv.setItem(13, kit2);
+        inv.setItem(15, kit3);
+        inv.setItem(22, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
+        player.openInventory(inv);
     }
 
     // ---------- Spawns menu ----------
@@ -827,62 +1182,6 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         player.openInventory(inv);
     }
 
-    // ---------- Personal kits ----------
-
-    private void openPersonalKitsGUI(Player player) {
-        Inventory inv = Bukkit.createInventory(null, 27, Component.text("My Kits").color(NamedTextColor.DARK_GRAY));
-        int[] slots = { 11, 13, 15 };
-        for (int i = 0; i < 3; i++) {
-            boolean hasKit = kitsDb.contains("playerkits." + player.getUniqueId() + "." + i);
-            Material mat = hasKit ? Material.ENDER_CHEST : Material.CHEST;
-            inv.setItem(slots[i], createGuiItem(mat, Component.text("Kit Slot " + (i + 1)).color(NamedTextColor.GOLD),
-                    "Left-Click: Load this kit", "Right-Click: Save your current inventory here",
-                    hasKit ? "Status: Saved" : "Status: Empty"));
-        }
-        inv.setItem(22, createGuiItem(Material.ARROW, Component.text("Close").color(NamedTextColor.GRAY)));
-        player.openInventory(inv);
-    }
-
-    private void savePersonalKit(Player player, int slotIndex) {
-        List<ItemStack> combined = new ArrayList<>();
-        combined.addAll(Arrays.asList(player.getInventory().getStorageContents()));
-        combined.addAll(Arrays.asList(player.getInventory().getArmorContents()));
-        combined.add(player.getInventory().getItemInOffHand());
-        kitsDb.set("playerkits." + player.getUniqueId() + "." + slotIndex, combined);
-        saveKitsDatabase();
-        player.sendMessage(Component.text("Saved your current inventory to Kit Slot " + (slotIndex + 1) + "!").color(NamedTextColor.GREEN));
-    }
-
-    private void loadPersonalKit(Player player, int slotIndex) {
-        String path = "playerkits." + player.getUniqueId() + "." + slotIndex;
-        if (!kitsDb.contains(path)) {
-            player.sendMessage(Component.text("Kit Slot " + (slotIndex + 1) + " is empty.").color(NamedTextColor.RED));
-            return;
-        }
-        @SuppressWarnings("unchecked")
-        List<ItemStack> saved = (List<ItemStack>) kitsDb.getList(path);
-        if (saved == null) return;
-
-        int mainSize = player.getInventory().getStorageContents().length;
-        int armorSize = player.getInventory().getArmorContents().length;
-
-        ItemStack[] main = new ItemStack[mainSize];
-        ItemStack[] armor = new ItemStack[armorSize];
-        ItemStack offhand = null;
-
-        for (int i = 0; i < saved.size(); i++) {
-            ItemStack item = saved.get(i);
-            if (i < mainSize) main[i] = item;
-            else if (i < mainSize + armorSize) armor[i - mainSize] = item;
-            else offhand = item;
-        }
-
-        player.getInventory().setStorageContents(main);
-        player.getInventory().setArmorContents(armor);
-        player.getInventory().setItemInOffHand(offhand);
-        player.sendMessage(Component.text("Loaded Kit Slot " + (slotIndex + 1) + "!").color(NamedTextColor.GREEN));
-    }
-
     // ==========================================
     // Event Listeners (GUI Clicks & Spawns)
     // ==========================================
@@ -895,27 +1194,10 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
         if (title.equals("Custom Teams Settings")) {
             e.setCancelled(true);
-            if (e.getRawSlot() == 11) openTeamsMenuGUI(player);
-            else if (e.getRawSlot() == 13) openSpawnsMenuGUI(player);
-            else if (e.getRawSlot() == 15) openKitCreatorGUI(player);
-            else if (e.getRawSlot() == 24) {
-                targetGameMode = (targetGameMode == GameMode.SURVIVAL) ? GameMode.ADVENTURE : GameMode.SURVIVAL;
-                getConfig().set("settings.gamemode-on-start", targetGameMode.name());
-                saveConfig();
-                openMainGUI(player);
-            }
-            else if (e.getRawSlot() == 25) {
-                naturalRegenEnabled = !naturalRegenEnabled;
-                getConfig().set("settings.natural-regen", naturalRegenEnabled);
-                saveConfig();
-                openMainGUI(player);
-            }
-            else if (e.getRawSlot() == 26) {
-                healthOnKill = !healthOnKill;
-                getConfig().set("settings.health-on-kill", healthOnKill);
-                saveConfig();
-                openMainGUI(player);
-            }
+            if (e.getRawSlot() == 10) openTeamsMenuGUI(player);
+            else if (e.getRawSlot() == 12) openSpawnsMenuGUI(player);
+            else if (e.getRawSlot() == 14) openPlayerKitChoiceGUI(player);
+            else if (e.getRawSlot() == 16) openGameOptionsGUI(player);
             else if (e.getRawSlot() == 22) {
                 player.closeInventory();
                 if (eventRunning) {
@@ -934,10 +1216,75 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 }
             }
         }
+        else if (title.equals("Game Options")) {
+            e.setCancelled(true);
+            if (e.getRawSlot() == 10) {
+                targetGameMode = (targetGameMode == GameMode.SURVIVAL) ? GameMode.ADVENTURE : GameMode.SURVIVAL;
+                getConfig().set("settings.gamemode-on-start", targetGameMode.name());
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 11) {
+                naturalRegenEnabled = !naturalRegenEnabled;
+                getConfig().set("settings.natural-regen", naturalRegenEnabled);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 12) {
+                healthOnKill = !healthOnKill;
+                getConfig().set("settings.health-on-kill", healthOnKill);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 14) {
+                startCountdownSeconds = cycleTime(startCountdownSeconds);
+                getConfig().set("settings.start-countdown", startCountdownSeconds);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 15) {
+                inventoryManagementSeconds = cycleTime(inventoryManagementSeconds);
+                getConfig().set("settings.inventory-management-time", inventoryManagementSeconds);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 16) {
+                celebrationSeconds = cycleTime(celebrationSeconds);
+                getConfig().set("settings.celebration-time", celebrationSeconds);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 19) {
+                healthIndicatorEnabled = !healthIndicatorEnabled;
+                getConfig().set("settings.health-indicator", healthIndicatorEnabled);
+                saveConfig();
+                applyHealthIndicatorDisplay();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 20) {
+                itemDropEnabled = !itemDropEnabled;
+                getConfig().set("settings.item-drop-enabled", itemDropEnabled);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 21) {
+                spawnInvincibilitySeconds = cycleTime(spawnInvincibilitySeconds);
+                getConfig().set("settings.spawn-invincibility", spawnInvincibilitySeconds);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 22) {
+                dropItemsOnDeath = !dropItemsOnDeath;
+                getConfig().set("settings.drop-items-on-death", dropItemsOnDeath);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 26) {
+                openMainGUI(player);
+            }
+        }
         else if (title.equals("Team Management")) {
             e.setCancelled(true);
-            if (e.getRawSlot() == 11) openFFASelectGUI(player, 0);
-            else if (e.getRawSlot() == 15) openColorSelectGUI(player);
+            if (e.getRawSlot() == 4) {
+                queuedMode = (queuedMode == EventMode.TEAMS) ? EventMode.FFA : EventMode.TEAMS;
+                openTeamsMenuGUI(player);
+            }
+            else if (e.getRawSlot() == 11) openFFASelectGUI(player, 0);
+            else if (e.getRawSlot() == 14) openColorSelectGUI(player);
+            else if (e.getRawSlot() == 15) {
+                autofillTeams(player);
+                openTeamsMenuGUI(player);
+            }
             else if (e.getRawSlot() == 22) openMainGUI(player);
         }
         else if (title.equals("FFA Participant Selector")) {
@@ -998,8 +1345,8 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 }
             }
         }
-        else if (title.equals("Master Kit Creator")) {
-            if (e.getRawSlot() < 17) {
+        else if (title.startsWith("Master Kit Creator")) {
+            if (e.getRawSlot() >= 0 && e.getRawSlot() < 17) {
                 ItemStack clicked = e.getCurrentItem();
                 if (clicked != null && clicked.getType().name().endsWith("GLASS_PANE")) {
                     e.setCancelled(true);
@@ -1013,8 +1360,26 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
             if (e.getRawSlot() == 17) {
                 e.setCancelled(true);
-                saveKitFromGUI(player, e.getInventory());
+                int kitNumber = editingKitNumber.getOrDefault(player.getUniqueId(), 1);
+                saveKitFromGUI(player, e.getInventory(), kitNumber);
                 player.closeInventory();
+                Bukkit.getScheduler().runTask(this, () -> openPlayerKitChoiceGUI(player));
+            }
+        }
+        else if (title.equals("My Kits")) {
+            e.setCancelled(true);
+            int kitNumber = e.getRawSlot() == 11 ? 1 : e.getRawSlot() == 13 ? 2 : e.getRawSlot() == 15 ? 3 : 0;
+            if (kitNumber != 0) {
+                if (e.getClick().isRightClick()) {
+                    openMasterKitEditorGUI(player, kitNumber);
+                } else {
+                    kitsDb.set("playerkits." + player.getUniqueId() + ".choice", kitNumber);
+                    saveKitsDatabase();
+                    player.sendMessage(Component.text("You selected Kit " + kitNumber + "!").color(NamedTextColor.GREEN));
+                    openPlayerKitChoiceGUI(player);
+                }
+            } else if (e.getRawSlot() == 22) {
+                openMainGUI(player);
             }
         }
         else if (title.equals("Spawn Setup")) {
@@ -1041,20 +1406,6 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 openSpawnsMenuGUI(player);
             }
         }
-        else if (title.equals("My Kits")) {
-            e.setCancelled(true);
-            int[] slots = { 11, 13, 15 };
-            int idx = -1;
-            for (int i = 0; i < slots.length; i++) if (slots[i] == e.getRawSlot()) idx = i;
-
-            if (idx >= 0) {
-                if (e.isLeftClick()) loadPersonalKit(player, idx);
-                else if (e.isRightClick()) savePersonalKit(player, idx);
-                openPersonalKitsGUI(player);
-            } else if (e.getRawSlot() == 22) {
-                player.closeInventory();
-            }
-        }
     }
 
     @EventHandler
@@ -1062,25 +1413,12 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         if (!(e.getPlayer() instanceof Player player)) return;
         String title = PlainTextComponentSerializer.plainText().serialize(e.getView().title());
 
-        if (title.equals("Master Kit Creator") && savedKitBuilderInventories.containsKey(player.getUniqueId())) {
+        if (title.startsWith("Master Kit Creator") && savedKitBuilderInventories.containsKey(player.getUniqueId())) {
             player.setGameMode(savedKitBuilderGameModes.get(player.getUniqueId()));
             player.getInventory().setContents(savedKitBuilderInventories.get(player.getUniqueId()));
             savedKitBuilderInventories.remove(player.getUniqueId());
             savedKitBuilderGameModes.remove(player.getUniqueId());
         }
-    }
-
-    private void saveKitFromGUI(Player player, Inventory gui) {
-        List<ItemStack> kitToSave = new ArrayList<>(Arrays.asList(gui.getContents()));
-        for (int i = 0; i < 18; i++) {
-            ItemStack item = kitToSave.get(i);
-            if (item != null && (item.getType().name().contains("GLASS_PANE") || item.getType() == Material.EMERALD_BLOCK)) {
-                kitToSave.set(i, null);
-            }
-        }
-        kitsDb.set("kits.active", kitToSave);
-        saveKitsDatabase();
-        player.sendMessage(Component.text("Master Event Kit saved!").color(NamedTextColor.GREEN));
     }
 
     // ==========================================
@@ -1091,6 +1429,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         player.closeInventory();
         UUID id = player.getUniqueId();
         teamSpawnEditMode.add(id);
+        teamSpawnEditPrevGameMode.put(id, player.getGameMode());
 
         Map<EventTeam, List<Location>> buffer = new EnumMap<>(EventTeam.class);
         for (EventTeam team : EventTeam.values()) {
@@ -1139,16 +1478,44 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         }
 
         player.getInventory().clear();
-        player.setGameMode(GameMode.SURVIVAL);
+        GameMode restoreMode = teamSpawnEditPrevGameMode.remove(id);
+        player.setGameMode(restoreMode != null ? restoreMode : GameMode.SURVIVAL);
+        openMainGUI(player);
     }
 
-    private Location getRandomTeamSpawn(EventTeam team) {
+    private List<Location> getTeamSpawnPoints(EventTeam team) {
         List<?> raw = kitsDb.getList("spawns." + team.name());
-        if (raw == null || raw.isEmpty()) return null;
         List<Location> locs = new ArrayList<>();
-        for (Object o : raw) if (o instanceof Location loc) locs.add(loc);
-        if (locs.isEmpty()) return null;
-        return locs.get(new Random().nextInt(locs.size()));
+        if (raw != null) for (Object o : raw) if (o instanceof Location loc) locs.add(loc);
+        return locs;
+    }
+
+    /**
+     * Spreads a team's members across its configured spawn points as evenly as
+     * possible. With at least as many spawns as members, every player gets a
+     * distinct point. With fewer spawns than members, the shuffled roster
+     * wraps around the shuffled spawn list (index % spawnCount), so only as
+     * many players as strictly necessary end up sharing a single point (e.g.
+     * 4 players / 3 spawns -> exactly one pair shares one point) rather than
+     * everyone landing on the same random spot. Each resulting location is
+     * also snapped to solid ground via findSafeLocation so nobody spawns
+     * hovering, even if the world has changed since the spawn was set.
+     */
+    private Map<UUID, Location> assignTeamSpawns(List<Player> members, List<Location> spawns) {
+        Map<UUID, Location> result = new HashMap<>();
+        if (spawns.isEmpty() || members.isEmpty()) return result;
+
+        List<Location> shuffledSpawns = new ArrayList<>(spawns);
+        Collections.shuffle(shuffledSpawns);
+        List<Player> shuffledMembers = new ArrayList<>(members);
+        Collections.shuffle(shuffledMembers);
+
+        int spawnCount = shuffledSpawns.size();
+        for (int i = 0; i < shuffledMembers.size(); i++) {
+            Location rawSpawn = shuffledSpawns.get(i % spawnCount);
+            result.put(shuffledMembers.get(i).getUniqueId(), findSafeLocation(rawSpawn));
+        }
+        return result;
     }
 
     @EventHandler
@@ -1255,6 +1622,10 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         UUID id = e.getPlayer().getUniqueId();
         if (teamSpawnEditMode.contains(id) || ffaSpawnEditMode.contains(id)) {
             e.setCancelled(true);
+            return;
+        }
+        if (!itemDropEnabled && eventRunning && isParticipant(id)) {
+            e.setCancelled(true);
         }
     }
 
@@ -1269,6 +1640,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         ffaSpawnEditType.put(id, "EXACT");
         ffaExactSpawnNeeded.put(id, needed);
         ffaExactSpawnBuffer.put(id, new ArrayList<>());
+        ffaSpawnEditPrevGameMode.put(id, player.getGameMode());
 
         player.getInventory().clear();
         player.setGameMode(GameMode.CREATIVE);
@@ -1294,6 +1666,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         UUID id = player.getUniqueId();
         ffaSpawnEditMode.add(id);
         ffaSpawnEditType.put(id, "RADIUS");
+        ffaSpawnEditPrevGameMode.put(id, player.getGameMode());
 
         player.getInventory().clear();
         player.setGameMode(GameMode.CREATIVE);
@@ -1330,7 +1703,9 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         ffaExactSpawnBuffer.remove(id);
         ffaExactSpawnNeeded.remove(id);
         player.getInventory().clear();
-        player.setGameMode(GameMode.SURVIVAL);
+        GameMode restoreMode = ffaSpawnEditPrevGameMode.remove(id);
+        player.setGameMode(restoreMode != null ? restoreMode : GameMode.SURVIVAL);
+        openMainGUI(player);
     }
 
     private List<Location> resolveFfaSpawns(int n) {
@@ -1340,7 +1715,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
         if ("EXACT".equals(mode)) {
             List<?> raw = kitsDb.getList("ffaspawns.points");
-            if (raw != null) for (Object o : raw) if (o instanceof Location loc) spawns.add(loc);
+            if (raw != null) for (Object o : raw) if (o instanceof Location loc) spawns.add(findSafeLocation(loc));
             Collections.shuffle(spawns);
         } else if ("RADIUS".equals(mode)) {
             Location center = kitsDb.getLocation("ffaspawns.center");
@@ -1369,7 +1744,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     /**
      * Searches near a candidate column for a safe standing spot (solid ground,
      * two passable blocks above it, no lava/fire) to avoid spawning players
-     * inside blocks where they would immediately suffocate or take damage.
+     * inside blocks where they would immediately suffocate or take damage
      */
     private Location findSafeLocation(Location loc) {
         World world = loc.getWorld();
@@ -1409,9 +1784,38 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     // Team & Game Interactions
     // ==========================================
 
+    private static final int TOTAL_KITS = 3;
+
+    /**
+     * Tries the chosen kit first, then cycles through the remaining kit slots
+     * (in order) looking for the first one that has actually been built (54
+     * saved slots) among the owner's 3 personal kits, so nobody ends up
+     * empty-handed just because the preferred kit hasn't been designed yet.
+     * "kitOwnerId" is whoever's kit selection is being used - see giveKit().
+     */
+    private List<ItemStack> resolveKitContents(UUID kitOwnerId, int choice) {
+        for (int attempt = 0; attempt < TOTAL_KITS; attempt++) {
+            int kitNum = ((choice - 1 + attempt) % TOTAL_KITS) + 1;
+            @SuppressWarnings("unchecked")
+            List<ItemStack> kit = (List<ItemStack>) kitsDb.getList("playerkits." + kitOwnerId + ".kit" + kitNum);
+            if (kit != null && kit.size() == 54) return kit;
+        }
+        return null;
+    }
+
+    /**
+     * Everyone in the match uses the host's kit - the kit belonging to
+     * whoever clicked "Start" (eventHostId) - EXCEPT the host themself, who
+     * of course still uses their own. Players still build and choose among
+     * their own 3 kits in "My Kits"; that selection only actually gets
+     * equipped when they are hosting the event.
+     */
     private void giveKit(Player player) {
-        @SuppressWarnings("unchecked")
-        List<ItemStack> kitContents = (List<ItemStack>) kitsDb.getList("kits.active");
+        UUID playerId = player.getUniqueId();
+        UUID kitOwnerId = (eventHostId != null) ? eventHostId : playerId;
+        int choice = kitsDb.getInt("playerkits." + kitOwnerId + ".choice", 1);
+        List<ItemStack> kitContents = resolveKitContents(kitOwnerId, choice);
+
         if (kitContents != null && kitContents.size() == 54) {
             player.getInventory().clear();
 
