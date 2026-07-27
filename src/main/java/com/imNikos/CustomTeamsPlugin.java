@@ -1744,7 +1744,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     /**
      * Searches near a candidate column for a safe standing spot (solid ground,
      * two passable blocks above it, no lava/fire) to avoid spawning players
-     * inside blocks where they would immediately suffocate or take damage
+     * inside blocks where they would immediately suffocate or take damage.
      */
     private Location findSafeLocation(Location loc) {
         World world = loc.getWorld();
