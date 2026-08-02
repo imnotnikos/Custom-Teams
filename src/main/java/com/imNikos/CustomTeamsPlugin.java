@@ -9,8 +9,10 @@ import org.bukkit.Bukkit;
 import org.bukkit.Color;
 import org.bukkit.FireworkEffect;
 import org.bukkit.GameMode;
+import org.bukkit.GameRule;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.Particle;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.boss.BarColor;
@@ -23,6 +25,7 @@ import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.enchantments.Enchantment;
+import org.bukkit.entity.AreaEffectCloud;
 import org.bukkit.entity.Firework;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -32,6 +35,7 @@ import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityRegainHealthEvent;
+import org.bukkit.event.entity.LingeringPotionSplashEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
@@ -145,6 +149,17 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     private boolean itemDropEnabled = true;          // item drops for participants
     private boolean dropItemsOnDeath = true;          // whether death drops actually land on the ground
 
+    // World game-rule toggles (applied server-wide to every loaded world)
+    private boolean mobGriefingEnabled = true;     // gamerule mobGriefing (explosions breaking blocks, etc.)
+    private boolean daylightCycleEnabled = true;   // gamerule doDaylightCycle (time of day progression)
+    private boolean mobSpawningEnabled = true;     // gamerule doMobSpawning
+    private boolean weatherCycleEnabled = true;    // gamerule doWeatherCycle
+
+    // Lingering potions thrown as "smoke grenades" - spawns a poof particle burst
+    // at the area effect cloud's location for as long as the cloud lives, instead
+    // of relying on a repeating /execute at @e[type=area_effect_cloud] command.
+    private boolean lingeringSmokeGrenadesEnabled = false;
+
     private Objective healthObjective;
 
     // Modes
@@ -159,7 +174,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
     private final Map<UUID, ItemStack[]> savedKitBuilderInventories = new HashMap<>();
     private final Map<UUID, GameMode> savedKitBuilderGameModes = new HashMap<>();
-    private final Map<UUID, Integer> editingKitNumber = new HashMap<>();
+
 
     // Teams mode
     private final Map<UUID, EventTeam> playerTeams = new HashMap<>();
@@ -170,6 +185,54 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     private final Map<UUID, Integer> ffaSelectPage = new HashMap<>();
     private Set<UUID> ffaPendingPlayers = new HashSet<>(); // finalized roster for the next FFA start
     private final Set<UUID> ffaPlayers = new HashSet<>();  // active participants while FFA is running
+
+    // ==========================================
+    // Lives System
+    // ==========================================
+    private int maxLives = 1; // Game Options counter, minimum 1
+    private final Map<UUID, Integer> livesRemaining = new HashMap<>(); // per-participant lives left this match
+
+    // ==========================================
+    // Kit System (revamped: unlimited, admin-managed kits)
+    // ==========================================
+    private static final String UNIVERSAL_TEAM = "UNIVERSAL";
+    private boolean kitSelectionPhaseEnabled = false; // global game option
+    // Which kit (by id, within the event host's kit library) each participant is
+    // currently using this match - used so lives-respawns re-equip the same kit.
+    private final Map<UUID, String> assignedKitId = new HashMap<>();
+    // In-progress kit selection during the Kit Selection Phase: participant -> kitId chosen so far.
+    private final Map<UUID, String> kitSelectionChoice = new HashMap<>();
+    // Participants who currently have the "Choose Your Kit" GUI open, so it can be live-refreshed.
+    private final Set<UUID> kitSelectionGuiOpenPlayers = new HashSet<>();
+    private BukkitTask kitSelectionTimerTask = null;
+    private boolean kitSelectionPhaseActive = false;
+
+    // Kit list / editor GUI paging + in-progress state
+    private final Map<UUID, Integer> kitListPage = new HashMap<>();
+    private final Map<UUID, String> editingKitId = new HashMap<>();
+    // Player is expected to type a new kit name in chat next (Rename button)
+    private final Map<UUID, String> awaitingKitNameInput = new HashMap<>();
+
+    // In-progress (unsaved) kit builder state, indexed exactly like a saved kit's
+    // 54-slot "contents" list (0-4 armor+offhand, 5-16 potions, 17 unused,
+    // 18-53 the 36-slot inventory). Populated when editing begins and kept in
+    // sync as the admin navigates between the main editor / potions / toggles
+    // sub-screens, so nothing is lost until they back all the way out.
+    private final Map<UUID, ItemStack[]> kitBuilderStage = new HashMap<>();
+    // The icon item currently staged for the kit being edited (null = no custom icon).
+    private final Map<UUID, ItemStack> kitBuilderIcon = new HashMap<>();
+    // Set right before switching between kit-editor sub-screens so the
+    // InventoryCloseEvent this triggers doesn't restore the admin's real
+    // inventory/gamemode or wipe the in-progress kit builder state.
+    private final Set<UUID> kitEditorInternalNav = new HashSet<>();
+
+    private static final Material ICON_PLACEHOLDER = Material.YELLOW_STAINED_GLASS_PANE;
+    private static final Material POTION_PLACEHOLDER = Material.MAGENTA_STAINED_GLASS_PANE;
+    private static final Material HELMET_PLACEHOLDER = Material.RED_STAINED_GLASS_PANE;
+    private static final Material CHESTPLATE_PLACEHOLDER = Material.RED_STAINED_GLASS_PANE;
+    private static final Material LEGGINGS_PLACEHOLDER = Material.RED_STAINED_GLASS_PANE;
+    private static final Material BOOTS_PLACEHOLDER = Material.RED_STAINED_GLASS_PANE;
+    private static final Material OFFHAND_PLACEHOLDER = Material.BLUE_STAINED_GLASS_PANE;
 
     // Spectating / invincibility / freeze
     private final Set<UUID> spectatingPlayers = new HashSet<>();
@@ -183,6 +246,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     private final Map<UUID, double[]> spawnLandingLock = new HashMap<>();
 
     private BukkitTask healthIndicatorTask = null;
+    private BukkitTask livesActionBarTask = null;
 
     // Team spawn editing
     private final Set<UUID> teamSpawnEditMode = new HashSet<>();
@@ -218,6 +282,14 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         healthIndicatorEnabled = getConfig().getBoolean("settings.health-indicator", false);
         itemDropEnabled = getConfig().getBoolean("settings.item-drop-enabled", true);
         dropItemsOnDeath = getConfig().getBoolean("settings.drop-items-on-death", true);
+        maxLives = Math.max(1, getConfig().getInt("settings.max-lives", 1));
+        kitSelectionPhaseEnabled = getConfig().getBoolean("settings.kit-selection-phase", false);
+        mobGriefingEnabled = getConfig().getBoolean("settings.mob-griefing", true);
+        daylightCycleEnabled = getConfig().getBoolean("settings.daylight-cycle", true);
+        mobSpawningEnabled = getConfig().getBoolean("settings.mob-spawning", true);
+        weatherCycleEnabled = getConfig().getBoolean("settings.weather-cycle", true);
+        lingeringSmokeGrenadesEnabled = getConfig().getBoolean("settings.lingering-smoke-grenades", false);
+        applyAllWorldGameRules();
 
         Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
         for (EventTeam team : EventTeam.values()) {
@@ -269,6 +341,21 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         }
     }
 
+    /** Applies a single boolean gamerule to every currently loaded world. */
+    private void applyGameRule(GameRule<Boolean> rule, boolean value) {
+        for (World world : Bukkit.getWorlds()) {
+            world.setGameRule(rule, value);
+        }
+    }
+
+    /** Re-applies all four world-toggle game rules (called on enable and whenever one is flipped). */
+    private void applyAllWorldGameRules() {
+        applyGameRule(GameRule.MOB_GRIEFING, mobGriefingEnabled);
+        applyGameRule(GameRule.DO_DAYLIGHT_CYCLE, daylightCycleEnabled);
+        applyGameRule(GameRule.DO_MOB_SPAWNING, mobSpawningEnabled);
+        applyGameRule(GameRule.DO_WEATHER_CYCLE, weatherCycleEnabled);
+    }
+
     /**
      * Runs only while an event is live. Every tick-and-a-half it (re)writes a
      * score for each active, non-spectating participant so only participating
@@ -307,10 +394,62 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         }
     }
 
+    /**
+     * Shows each participant their own remaining-lives count just above the hotbar
+     * (action bar), refreshed periodically since action bar text fades out on its
+     * own after a couple seconds. Spectators (out of lives) see nothing.
+     */
+    private void startLivesActionBarTask() {
+        stopLivesActionBarTask();
+        livesActionBarTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (!eventRunning) { cancel(); return; }
+
+                Set<UUID> participants = currentMode == EventMode.FFA ? ffaPlayers : playerTeams.keySet();
+                for (UUID uuid : participants) {
+                    if (spectatingPlayers.contains(uuid)) continue;
+                    Player p = Bukkit.getPlayer(uuid);
+                    if (p == null || !p.isOnline()) continue;
+                    int lives = livesRemaining.getOrDefault(uuid, maxLives);
+                    p.sendActionBar(Component.text("\u2764 Lives: " + lives).color(NamedTextColor.LIGHT_PURPLE).decorate(TextDecoration.BOLD));
+                }
+            }
+        }.runTaskTimer(this, 0L, 20L);
+    }
+
+    private void stopLivesActionBarTask() {
+        if (livesActionBarTask != null) {
+            livesActionBarTask.cancel();
+            livesActionBarTask = null;
+        }
+    }
+
     private int cycleTime(int current) {
         if (current <= 0) return 5;
         if (current == 5) return 10;
         return 0;
+    }
+
+    /**
+     * When the Kit Selection Phase is enabled, the inventory-management timer
+     * doubles as the kit-choosing window, so a 0-second timer is disallowed
+     * (the GUI needs time to be usable) and 15s/20s options are added on top
+     * of the usual 5s/10s. When the phase is disabled, behaves like cycleTime.
+     */
+    private int cycleInventoryManagementTime(int current) {
+        if (!kitSelectionPhaseEnabled) return cycleTime(current);
+        if (current <= 5) return 10;
+        if (current == 10) return 15;
+        if (current == 15) return 20;
+        return 5;
+    }
+
+    private int cycleLives(int current, int delta) {
+        int updated = current + delta;
+        if (updated < 1) updated = 1;
+        if (updated > 20) updated = 20;
+        return updated;
     }
 
     // ==========================================
@@ -335,11 +474,6 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             return true;
         }
 
-        if (args[0].equalsIgnoreCase("kits")) {
-            openPlayerKitChoiceGUI(player);
-            return true;
-        }
-
         return true;
     }
 
@@ -348,7 +482,6 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         if (args.length == 1) {
             List<String> completions = new ArrayList<>();
             completions.add("leave");
-            completions.add("kits");
             List<String> result = new ArrayList<>();
             for (String c : completions) {
                 if (c.toLowerCase().startsWith(args[0].toLowerCase())) result.add(c);
@@ -416,6 +549,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         eventHostId = admin.getUniqueId();
         applyHealthIndicatorDisplay();
         startHealthIndicatorTask();
+        startLivesActionBarTask();
         Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
         List<Player> startedPlayers = new ArrayList<>();
 
@@ -443,7 +577,12 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
                 setupCommonMatchState(p);
                 p.playerListName(Component.text(p.getName()).color(NamedTextColor.WHITE));
-                giveKit(p);
+                livesRemaining.put(uuid, maxLives);
+                if (kitSelectionPhaseApplies()) {
+                    p.getInventory().clear();
+                } else {
+                    giveKit(p);
+                }
                 eventBossBar.addPlayer(p);
                 startedPlayers.add(p);
             }
@@ -484,7 +623,12 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 if (sTeam != null) sTeam.addEntry(p.getName());
                 p.playerListName(Component.text(p.getName()).color(team.getScoreboardColor()));
 
-                giveKit(p);
+                livesRemaining.put(p.getUniqueId(), maxLives);
+                if (kitSelectionPhaseApplies()) {
+                    p.getInventory().clear();
+                } else {
+                    giveKit(p);
+                }
                 eventBossBar.addPlayer(p);
                 startedPlayers.add(p);
             }
@@ -503,7 +647,9 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
      * spawn-invincibility timer (0/5/10s), same as the other event timers.
      */
     private void beginMatchSequence(List<Player> participants) {
-        if (inventoryManagementSeconds > 0) {
+        if (kitSelectionPhaseApplies()) {
+            beginKitSelectionPhase(participants);
+        } else if (inventoryManagementSeconds > 0) {
             for (Player p : participants) {
                 UUID id = p.getUniqueId();
                 frozenPlayers.add(id);
@@ -572,7 +718,15 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         }
 
         stopHealthIndicatorTask();
+        stopLivesActionBarTask();
         applyHealthIndicatorDisplay();
+
+        if (kitSelectionTimerTask != null) { kitSelectionTimerTask.cancel(); kitSelectionTimerTask = null; }
+        kitSelectionPhaseActive = false;
+        kitSelectionChoice.clear();
+        kitSelectionGuiOpenPlayers.clear();
+        assignedKitId.clear();
+        livesRemaining.clear();
 
         preEventInventories.clear();
         preEventGameModes.clear();
@@ -605,6 +759,10 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         invinciblePlayers.remove(id);
         frozenPlayers.remove(id);
         spawnLandingLock.remove(id);
+        livesRemaining.remove(id);
+        assignedKitId.remove(id);
+        kitSelectionChoice.remove(id);
+        kitSelectionGuiOpenPlayers.remove(id);
         if (healthObjective != null) Bukkit.getScoreboardManager().getMainScoreboard().resetScores(player);
         eventBossBar.removePlayer(player);
         updateGameState();
@@ -653,10 +811,10 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     public void onPlayerDeath(PlayerDeathEvent e) {
         if (!eventRunning || celebrationActive) return;
         Player victim = e.getEntity();
-        if (!isParticipant(victim.getUniqueId())) return;
+        UUID vid = victim.getUniqueId();
+        if (!isParticipant(vid)) return;
 
-        deathLocations.put(victim.getUniqueId(), victim.getLocation());
-        spawnLandingLock.remove(victim.getUniqueId());
+        spawnLandingLock.remove(vid);
 
         if (!dropItemsOnDeath) {
             e.getDrops().clear();
@@ -671,6 +829,17 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             }
         }
 
+        int remaining = livesRemaining.getOrDefault(vid, maxLives) - 1;
+        livesRemaining.put(vid, remaining);
+
+        if (remaining > 0) {
+            // Still has lives left - will respawn alive at a team/FFA spawnpoint,
+            // so the exact death spot doesn't matter for the respawn location.
+            deathLocations.remove(vid);
+        } else {
+            deathLocations.put(vid, victim.getLocation());
+        }
+
         Bukkit.getScheduler().runTask(this, () -> victim.spigot().respawn());
     }
 
@@ -678,11 +847,34 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     public void onPlayerRespawn(PlayerRespawnEvent e) {
         if (!eventRunning) return;
         Player player = e.getPlayer();
-        if (isParticipant(player.getUniqueId())) {
-            spectatingPlayers.add(player.getUniqueId());
+        UUID id = player.getUniqueId();
+        if (!isParticipant(id)) return;
 
-            if (deathLocations.containsKey(player.getUniqueId())) {
-                e.setRespawnLocation(deathLocations.remove(player.getUniqueId()));
+        int remaining = livesRemaining.getOrDefault(id, 0);
+
+        if (remaining > 0) {
+            // Lives remain: respawn alive at the team's (or FFA's) spawnpoint, not as a spectator.
+            Location respawnLoc = resolveLivesRespawnLocation(player);
+            if (respawnLoc != null) {
+                e.setRespawnLocation(respawnLoc);
+                spawnLandingLock.put(id, new double[]{respawnLoc.getX(), respawnLoc.getZ()});
+            }
+
+            Bukkit.getScheduler().runTask(this, () -> {
+                setupCommonMatchState(player);
+                UUID kitOwnerId = currentKitOwnerId();
+                giveKitById(player, kitOwnerId != null ? kitOwnerId : id, assignedKitId.get(id));
+                grantInvincibility(player, spawnInvincibilitySeconds);
+                player.sendMessage(Component.text("You lost a life! Lives remaining: " + remaining).color(NamedTextColor.YELLOW));
+                player.showTitle(Title.title(
+                        Component.text("Respawned!").color(NamedTextColor.YELLOW).decorate(TextDecoration.BOLD),
+                        Component.text(remaining + " " + (remaining == 1 ? "life" : "lives") + " remaining").color(NamedTextColor.GRAY)));
+            });
+        } else {
+            spectatingPlayers.add(id);
+
+            if (deathLocations.containsKey(id)) {
+                e.setRespawnLocation(deathLocations.remove(id));
             }
 
             Bukkit.getScheduler().runTask(this, () -> {
@@ -691,6 +883,24 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 updateGameState();
             });
         }
+    }
+
+    /** Picks a safe respawn spot for a player who still has lives left: their team's spawn (Teams mode) or a configured FFA spawn. */
+    private Location resolveLivesRespawnLocation(Player player) {
+        if (currentMode == EventMode.TEAMS) {
+            EventTeam team = playerTeams.get(player.getUniqueId());
+            if (team != null) {
+                List<Location> spawns = getTeamSpawnPoints(team);
+                if (!spawns.isEmpty()) {
+                    Location raw = spawns.get(new Random().nextInt(spawns.size()));
+                    return findSafeLocation(raw);
+                }
+            }
+        } else if (currentMode == EventMode.FFA) {
+            List<Location> spawns = resolveFfaSpawns(1);
+            if (!spawns.isEmpty()) return spawns.get(0);
+        }
+        return player.getLocation();
     }
 
     private void updateGameState() {
@@ -759,6 +969,34 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 startCelebration(winnerIds, winnerTeam, playerTeams.keySet());
             }
         }
+    }
+
+    /**
+     * "Smoke grenade" lingering potions. Replaces a repeating command like:
+     *   execute at @e[type=minecraft:area_effect_cloud] run particle minecraft:poof ~ ~1 ~ 1.3 1.3 1.3 0 85 force
+     * A command-block loop like that re-scans every area effect cloud on the
+     * server on every single tick. This does the same visual (poof burst,
+     * force-rendered so it's visible past the normal particle distance) but
+     * only for the one cloud that was just created, and only for as long as
+     * that specific cloud stays alive - no repeated entity-selector lookups.
+     */
+    @EventHandler
+    public void onLingeringPotionSplash(LingeringPotionSplashEvent e) {
+        if (!lingeringSmokeGrenadesEnabled) return;
+        AreaEffectCloud cloud = e.getAreaEffectCloud();
+        if (cloud == null) return;
+
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (!cloud.isValid() || cloud.isDead()) {
+                    cancel();
+                    return;
+                }
+                Location loc = cloud.getLocation().add(0, 1, 0);
+                cloud.getWorld().spawnParticle(Particle.POOF, loc, 85, 1.3, 1.3, 1.3, 0, null, true);
+            }
+        }.runTaskTimer(this, 0L, 1L);
     }
 
     /**
@@ -911,7 +1149,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
         inv.setItem(10, createGuiItem(Material.LEATHER_CHESTPLATE, Component.text("Teams").color(NamedTextColor.AQUA), "Manage event teams."));
         inv.setItem(12, createGuiItem(Material.COMPASS, Component.text("Spawns").color(NamedTextColor.LIGHT_PURPLE), "Set spawn points."));
-        inv.setItem(14, createGuiItem(Material.DIAMOND_SWORD, Component.text("My Kits").color(NamedTextColor.GOLD), "Build and choose your own 3 kits.", "(Same as /ct kits. Only the event", "host's kit is actually used in-match.)"));
+        inv.setItem(14, createGuiItem(Material.DIAMOND_SWORD, Component.text("Admin Kits").color(NamedTextColor.GOLD), "Build unlimited kits, assign them to", "teams (or Universal), cap how many", "players may pick each one, and toggle", "the Kit Selection Phase.", "(Only the event host's kits are", "actually used in-match.)"));
         inv.setItem(16, createGuiItem(Material.COMMAND_BLOCK, Component.text("Game Options").color(NamedTextColor.YELLOW), "Gamemode, timers, and toggles."));
 
         if (eventRunning) {
@@ -927,7 +1165,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     }
 
     private void openGameOptionsGUI(Player player) {
-        Inventory inv = Bukkit.createInventory(null, 27, Component.text("Game Options").color(NamedTextColor.DARK_GRAY));
+        Inventory inv = Bukkit.createInventory(null, 45, Component.text("Game Options").color(NamedTextColor.DARK_GRAY));
 
         Material gmMat = targetGameMode == GameMode.SURVIVAL ? Material.IRON_PICKAXE : Material.MAP;
         inv.setItem(10, createGuiItem(gmMat, Component.text("Gamemode: " + targetGameMode.name()).color(NamedTextColor.YELLOW), "Click to toggle Survival/Adventure."));
@@ -960,7 +1198,38 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
 
         inv.setItem(21, createGuiItem(Material.SHIELD, Component.text("Spawn Invincibility: " + spawnInvincibilitySeconds + "s").color(NamedTextColor.AQUA), "Grace period after spawning in", "(and after kit management, if any)", "where players can't take or deal damage.", "Click to cycle: 0 / 5 / 10 seconds."));
 
-        inv.setItem(26, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
+        inv.setItem(23, createGuiItem(Material.TOTEM_OF_UNDYING, Component.text("Lives: " + maxLives).color(NamedTextColor.LIGHT_PURPLE),
+                "How many times a player respawns", "at their team's spawnpoint before", "being eliminated to spectator.",
+                "Left-click: +1  Right-click: -1  (min 1)"));
+
+        Material griefMat = mobGriefingEnabled ? Material.TNT : Material.BARRIER;
+        NamedTextColor griefColor = mobGriefingEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(28, createGuiItem(griefMat, Component.text("Mob Griefing: " + (mobGriefingEnabled ? "ON" : "OFF")).color(griefColor),
+                "Whether explosions/mobs can", "break or change blocks.", "Click to toggle. (Server-wide)"));
+
+        Material timeMat = daylightCycleEnabled ? Material.CLOCK : Material.DAYLIGHT_DETECTOR;
+        NamedTextColor timeColor = daylightCycleEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(29, createGuiItem(timeMat, Component.text("Time of Day: " + (daylightCycleEnabled ? "ON" : "OFF")).color(timeColor),
+                "Whether the day/night cycle", "progresses on its own.", "Click to toggle. (Server-wide)"));
+
+        Material spawnMat = mobSpawningEnabled ? Material.SPAWNER : Material.BARRIER;
+        NamedTextColor spawnColor = mobSpawningEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(30, createGuiItem(spawnMat, Component.text("Mob Spawning: " + (mobSpawningEnabled ? "ON" : "OFF")).color(spawnColor),
+                "Whether new mobs can", "naturally spawn.", "Click to toggle. (Server-wide)"));
+
+        Material weatherMat = weatherCycleEnabled ? Material.WATER_BUCKET : Material.SUNFLOWER;
+        NamedTextColor weatherColor = weatherCycleEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(31, createGuiItem(weatherMat, Component.text("Weather: " + (weatherCycleEnabled ? "ON" : "OFF")).color(weatherColor),
+                "Whether rain/thunder can", "occur naturally.", "Turning OFF also clears", "any weather right away.",
+                "Click to toggle. (Server-wide)"));
+
+        Material smokeMat = lingeringSmokeGrenadesEnabled ? Material.LINGERING_POTION : Material.GLASS_BOTTLE;
+        NamedTextColor smokeColor = lingeringSmokeGrenadesEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(32, createGuiItem(smokeMat, Component.text("Smoke Grenades: " + (lingeringSmokeGrenadesEnabled ? "ON" : "OFF")).color(smokeColor),
+                "Lingering potions puff out poof", "particles while they linger,", "like a smoke grenade.",
+                "Click to toggle."));
+
+        inv.setItem(40, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
         player.openInventory(inv);
     }
 
@@ -1082,83 +1351,319 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         player.openInventory(inv);
     }
 
-    // ---------- Kit Creator (each player builds their own 3 kits) ----------
+    // ---------- Kit data helpers (unlimited, admin-managed kits, locally tied to the editor) ----------
 
-    private void openMasterKitEditorGUI(Player player, int kitNumber) {
+    /**
+     * Returns the ordered list of kit ids owned by this editor, auto-creating
+     * 3 blank kits the first time this player's kit library is touched.
+     */
+    private List<String> getKitIds(UUID ownerId) {
+        List<String> ids = kitsDb.getStringList("playerkits." + ownerId + ".kitIds");
+        if (ids == null || ids.isEmpty()) {
+            ids = new ArrayList<>();
+            for (int i = 1; i <= 3; i++) {
+                String id = "kit" + i;
+                ids.add(id);
+                initKitDefaults(ownerId, id, "Kit " + i);
+            }
+            kitsDb.set("playerkits." + ownerId + ".kitIds", ids);
+            kitsDb.set("playerkits." + ownerId + ".nextKitSeq", 4);
+            saveKitsDatabase();
+        }
+        return new ArrayList<>(ids);
+    }
+
+    private void initKitDefaults(UUID ownerId, String kitId, String name) {
+        String base = "playerkits." + ownerId + ".kits." + kitId + ".";
+        kitsDb.set(base + "name", name);
+        kitsDb.set(base + "team", UNIVERSAL_TEAM);
+        kitsDb.set(base + "maxPlayers", 0);
+        kitsDb.set(base + "selectable", true);
+    }
+
+    private String createNewKit(UUID ownerId) {
+        List<String> ids = getKitIds(ownerId);
+        int seq = kitsDb.getInt("playerkits." + ownerId + ".nextKitSeq", ids.size() + 1);
+        String id = "kit" + seq;
+        ids.add(id);
+        initKitDefaults(ownerId, id, "Kit " + ids.size());
+        kitsDb.set("playerkits." + ownerId + ".kitIds", ids);
+        kitsDb.set("playerkits." + ownerId + ".nextKitSeq", seq + 1);
+        saveKitsDatabase();
+        return id;
+    }
+
+    private String kitBase(UUID ownerId, String kitId) { return "playerkits." + ownerId + ".kits." + kitId + "."; }
+
+    private String getKitName(UUID ownerId, String kitId) { return kitsDb.getString(kitBase(ownerId, kitId) + "name", kitId); }
+
+    /**
+     * Returns the item the admin dragged & dropped into the icon slot while
+     * editing this kit (full ItemStack, so custom names/enchants/etc. carry
+     * over), or a plain default if none has been set yet.
+     */
+    private ItemStack getKitIconItem(UUID ownerId, String kitId) {
+        ItemStack stored = kitsDb.getItemStack(kitBase(ownerId, kitId) + "iconItem", null);
+        if (stored != null) return stored.clone();
+        return new ItemStack(Material.LEATHER_CHESTPLATE);
+    }
+
+    /** Clones the kit's icon item and stamps the kit's name/lore onto it for list/selection displays. */
+    private ItemStack renderKitDisplayItem(ItemStack rawIcon, Component name, String... lore) {
+        ItemStack item = (rawIcon != null ? rawIcon.clone() : new ItemStack(Material.LEATHER_CHESTPLATE));
+        item.setAmount(1);
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            meta.displayName(name.decoration(TextDecoration.ITALIC, false));
+            List<Component> loreList = new ArrayList<>();
+            for (String line : lore) {
+                loreList.add(Component.text(line).color(NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false));
+            }
+            meta.lore(loreList);
+            item.setItemMeta(meta);
+        }
+        return item;
+    }
+
+    private String getKitTeam(UUID ownerId, String kitId) { return kitsDb.getString(kitBase(ownerId, kitId) + "team", UNIVERSAL_TEAM); }
+
+    private int getKitMaxPlayers(UUID ownerId, String kitId) { return kitsDb.getInt(kitBase(ownerId, kitId) + "maxPlayers", 0); }
+
+    private boolean getKitSelectable(UUID ownerId, String kitId) { return kitsDb.getBoolean(kitBase(ownerId, kitId) + "selectable", true); }
+
+    @SuppressWarnings("unchecked")
+    private List<ItemStack> getKitContents(UUID ownerId, String kitId) {
+        return (List<ItemStack>) kitsDb.getList(kitBase(ownerId, kitId) + "contents");
+    }
+
+    private boolean isKitBuilt(UUID ownerId, String kitId) {
+        List<ItemStack> contents = getKitContents(ownerId, kitId);
+        return contents != null && contents.size() == 54;
+    }
+
+    // ---------- Admin Kits list GUI (unlimited kits, paginated) ----------
+
+    private void openAdminKitsGUI(Player player, int page) {
+        UUID ownerId = player.getUniqueId();
+        List<String> ids = getKitIds(ownerId);
+        kitListPage.put(ownerId, page);
+
+        Inventory inv = Bukkit.createInventory(null, 54, Component.text("Admin Kits").color(NamedTextColor.DARK_GRAY));
+        String choice = kitsDb.getString("playerkits." + ownerId + ".choice", ids.isEmpty() ? null : ids.get(0));
+
+        int perPage = 45;
+        int start = page * perPage;
+        int slot = 0;
+        for (int i = start; i < ids.size() && slot < perPage; i++, slot++) {
+            String kitId = ids.get(i);
+            String team = getKitTeam(ownerId, kitId);
+            int maxPlayers = getKitMaxPlayers(ownerId, kitId);
+            boolean selectable = getKitSelectable(ownerId, kitId);
+
+            List<String> lore = new ArrayList<>();
+            lore.add("Team: " + (team.equals(UNIVERSAL_TEAM) ? "Universal" : team));
+            lore.add("Max Players: " + (maxPlayers <= 0 ? "Unlimited" : String.valueOf(maxPlayers)));
+            lore.add("Player Selection: " + (selectable ? "Enabled" : "Disabled"));
+            lore.add(isKitBuilt(ownerId, kitId) ? "Contents: Built" : "Contents: Empty");
+            if (kitId.equals(choice)) lore.add("SELECTED (your default kit)");
+            lore.add("Left-click to select as default.");
+            lore.add("Right-click to edit this kit.");
+
+            ItemStack item = renderKitDisplayItem(getKitIconItem(ownerId, kitId), Component.text(getKitName(ownerId, kitId)).color(NamedTextColor.GOLD), lore.toArray(new String[0]));
+            if (kitId.equals(choice)) {
+                ItemMeta meta = item.getItemMeta();
+                if (meta != null) {
+                    meta.addEnchant(Enchantment.UNBREAKING, 1, true);
+                    meta.addItemFlags(ItemFlag.HIDE_ENCHANTS);
+                    item.setItemMeta(meta);
+                }
+            }
+            inv.setItem(slot, item);
+        }
+
+        if (page > 0) inv.setItem(45, createGuiItem(Material.ARROW, Component.text("Previous Page").color(NamedTextColor.GRAY)));
+        inv.setItem(46, createGuiItem(Material.NETHER_STAR, Component.text("Add New Kit").color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD), "Creates a new blank kit."));
+
+        Material phaseMat = kitSelectionPhaseEnabled ? Material.LIME_DYE : Material.GRAY_DYE;
+        NamedTextColor phaseColor = kitSelectionPhaseEnabled ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(49, createGuiItem(phaseMat, Component.text("Kit Selection Phase: " + (kitSelectionPhaseEnabled ? "ON" : "OFF")).color(phaseColor),
+                "If ON, players choose from admin-", "approved kits during the inventory", "management phase before each match.", "Click to toggle."));
+
+        if (start + perPage < ids.size()) inv.setItem(52, createGuiItem(Material.ARROW, Component.text("Next Page").color(NamedTextColor.GRAY)));
+        inv.setItem(53, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
+        player.openInventory(inv);
+    }
+
+    // ---------- Kit editor GUIs (double-chest main editor + potions/toggles sub-screens) ----------
+
+    /** Returns item.clone(), or null if the slot is empty or still showing its placeholder. */
+    private ItemStack plainOrNull(ItemStack item, Material placeholder) {
+        if (item == null || item.getType() == placeholder) return null;
+        return item.clone();
+    }
+
+    /** Begins (or resumes) editing a kit: backs up the admin's real inventory/gamemode once, loads the saved kit into the in-progress staging buffer, and opens the main editor. */
+    private void beginEditingKit(Player player, String kitId) {
+        UUID ownerId = player.getUniqueId();
         if (player.getGameMode() != GameMode.CREATIVE) {
-            savedKitBuilderInventories.put(player.getUniqueId(), player.getInventory().getContents());
-            savedKitBuilderGameModes.put(player.getUniqueId(), player.getGameMode());
+            savedKitBuilderInventories.put(ownerId, player.getInventory().getContents());
+            savedKitBuilderGameModes.put(ownerId, player.getGameMode());
             player.getInventory().clear();
             player.setGameMode(GameMode.CREATIVE);
         }
-        editingKitNumber.put(player.getUniqueId(), kitNumber);
+        editingKitId.put(ownerId, kitId);
 
-        Inventory inv = Bukkit.createInventory(null, 54, Component.text("Master Kit Creator - Kit " + kitNumber).color(NamedTextColor.DARK_GRAY));
+        ItemStack[] stage = new ItemStack[54];
+        List<ItemStack> existing = getKitContents(ownerId, kitId);
+        if (existing != null && existing.size() == 54) {
+            for (int i = 0; i < 54; i++) stage[i] = existing.get(i);
+        }
+        kitBuilderStage.put(ownerId, stage);
+        kitBuilderIcon.put(ownerId, kitsDb.getItemStack(kitBase(ownerId, kitId) + "iconItem", null));
 
-        @SuppressWarnings("unchecked")
-        List<ItemStack> existingKit = (List<ItemStack>) kitsDb.getList("playerkits." + player.getUniqueId() + ".kit" + kitNumber);
-        if (existingKit != null && existingKit.size() == 54) {
-            for (int i = 0; i < 54; i++) {
-                if (existingKit.get(i) != null) inv.setItem(i, existingKit.get(i));
-            }
+        openMasterKitEditorGUI(player);
+    }
+
+    /**
+     * Main kit editor: a double-chest (54 slot) layout with 5 armor/offhand
+     * slots, a drag-and-drop icon slot, buttons to the potions and toggles
+     * sub-screens, a save button, and 36 free slots representing the kit's
+     * full inventory (main storage + hotbar, in that order).
+     */
+    private void openMasterKitEditorGUI(Player player) {
+        UUID ownerId = player.getUniqueId();
+        String kitId = editingKitId.get(ownerId);
+        ItemStack[] stage = kitBuilderStage.computeIfAbsent(ownerId, k -> new ItemStack[54]);
+        ItemStack icon = kitBuilderIcon.get(ownerId);
+
+        Inventory inv = Bukkit.createInventory(null, 54, Component.text("Master Kit Creator - " + getKitName(ownerId, kitId)).color(NamedTextColor.DARK_GRAY));
+
+        inv.setItem(0, stage[0] != null ? stage[0] : createGuiItem(HELMET_PLACEHOLDER, Component.text("Helmet Slot").color(NamedTextColor.RED)));
+        inv.setItem(1, stage[1] != null ? stage[1] : createGuiItem(CHESTPLATE_PLACEHOLDER, Component.text("Chestplate Slot").color(NamedTextColor.RED)));
+        inv.setItem(2, stage[2] != null ? stage[2] : createGuiItem(LEGGINGS_PLACEHOLDER, Component.text("Leggings Slot").color(NamedTextColor.RED)));
+        inv.setItem(3, stage[3] != null ? stage[3] : createGuiItem(BOOTS_PLACEHOLDER, Component.text("Boots Slot").color(NamedTextColor.RED)));
+        inv.setItem(4, stage[4] != null ? stage[4] : createGuiItem(OFFHAND_PLACEHOLDER, Component.text("Offhand Slot").color(NamedTextColor.BLUE)));
+
+        inv.setItem(5, icon != null ? icon.clone() : createGuiItem(ICON_PLACEHOLDER, Component.text("Kit Icon").color(NamedTextColor.YELLOW),
+                "Drag & drop any item here", "to use it as this kit's icon."));
+
+        inv.setItem(6, createGuiItem(Material.POTION, Component.text("Potion Effects").color(NamedTextColor.LIGHT_PURPLE), "Click to open the potion effects editor."));
+        inv.setItem(7, createGuiItem(Material.COMPARATOR, Component.text("Kit Toggles").color(NamedTextColor.YELLOW), "Rename, team, max players,", "and player selection.", "Click to open."));
+        inv.setItem(8, createGuiItem(Material.EMERALD_BLOCK, Component.text("SAVE KIT CONTENTS").color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD)));
+
+        for (int i = 0; i < 36; i++) {
+            inv.setItem(9 + i, stage[18 + i]);
         }
 
-        if (inv.getItem(0) == null) inv.setItem(0, createGuiItem(Material.RED_STAINED_GLASS_PANE, Component.text("Helmet Slot").color(NamedTextColor.RED)));
-        if (inv.getItem(1) == null) inv.setItem(1, createGuiItem(Material.RED_STAINED_GLASS_PANE, Component.text("Chestplate Slot").color(NamedTextColor.RED)));
-        if (inv.getItem(2) == null) inv.setItem(2, createGuiItem(Material.RED_STAINED_GLASS_PANE, Component.text("Leggings Slot").color(NamedTextColor.RED)));
-        if (inv.getItem(3) == null) inv.setItem(3, createGuiItem(Material.RED_STAINED_GLASS_PANE, Component.text("Boots Slot").color(NamedTextColor.RED)));
-        if (inv.getItem(4) == null) inv.setItem(4, createGuiItem(Material.BLUE_STAINED_GLASS_PANE, Component.text("Offhand Slot").color(NamedTextColor.BLUE)));
-
-        for (int i = 5; i <= 16; i++) {
-            if (inv.getItem(i) == null) inv.setItem(i, createGuiItem(Material.MAGENTA_STAINED_GLASS_PANE, Component.text("Potion Effect").color(NamedTextColor.LIGHT_PURPLE)));
+        for (int i = 45; i < 53; i++) {
+            inv.setItem(i, createGuiItem(Material.GRAY_STAINED_GLASS_PANE, Component.text(" ")));
         }
-
-        inv.setItem(17, createGuiItem(Material.EMERALD_BLOCK, Component.text("SAVE KIT " + kitNumber).color(NamedTextColor.GREEN).decorate(TextDecoration.BOLD)));
+        inv.setItem(53, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
 
         player.openInventory(inv);
-        player.sendMessage(Component.text("Editing Kit " + kitNumber + ". Place items in the slots. Click a stained glass pane with an item to swap it in. Click Emerald Block to save!").color(NamedTextColor.AQUA));
     }
 
-    private void saveKitFromGUI(Player player, Inventory gui, int kitNumber) {
-        List<ItemStack> kitToSave = new ArrayList<>(Arrays.asList(gui.getContents()));
-        for (int i = 0; i < 18; i++) {
-            ItemStack item = kitToSave.get(i);
-            if (item != null && (item.getType().name().contains("GLASS_PANE") || item.getType() == Material.EMERALD_BLOCK)) {
-                kitToSave.set(i, null);
-            }
+    /** Sub-screen for the 12 potion-effect slots (unchanged behavior from before: drop a potion item in to grant its effect(s)). */
+    private void openKitPotionsGUI(Player player) {
+        UUID ownerId = player.getUniqueId();
+        ItemStack[] stage = kitBuilderStage.computeIfAbsent(ownerId, k -> new ItemStack[54]);
+
+        Inventory inv = Bukkit.createInventory(null, 27, Component.text("Kit Potion Effects").color(NamedTextColor.DARK_GRAY));
+
+        for (int i = 0; i < 12; i++) {
+            inv.setItem(i, stage[5 + i] != null ? stage[5 + i] : createGuiItem(POTION_PLACEHOLDER, Component.text("Potion Effect").color(NamedTextColor.LIGHT_PURPLE),
+                    "Drag a potion here to grant", "its effect(s) when this kit is given."));
         }
-        kitsDb.set("playerkits." + player.getUniqueId() + ".kit" + kitNumber, kitToSave);
-        saveKitsDatabase();
-        player.sendMessage(Component.text("Kit " + kitNumber + " saved!").color(NamedTextColor.GREEN));
-    }
-
-    // ---------- Player kits (each player builds and chooses among their own 3 kits) ----------
-
-    private void openPlayerKitChoiceGUI(Player player) {
-        Inventory inv = Bukkit.createInventory(null, 27, Component.text("My Kits").color(NamedTextColor.DARK_GRAY));
-        int choice = kitsDb.getInt("playerkits." + player.getUniqueId() + ".choice", 1);
-
-        ItemStack kit1 = createGuiItem(Material.DIAMOND_CHESTPLATE, Component.text("Kit 1").color(NamedTextColor.AQUA),
-                choice == 1 ? "SELECTED" : "Left-click to select this kit.", "Right-click to edit this kit.");
-        ItemStack kit2 = createGuiItem(Material.GOLDEN_CHESTPLATE, Component.text("Kit 2").color(NamedTextColor.GOLD),
-                choice == 2 ? "SELECTED" : "Left-click to select this kit.", "Right-click to edit this kit.");
-        ItemStack kit3 = createGuiItem(Material.IRON_CHESTPLATE, Component.text("Kit 3").color(NamedTextColor.GRAY),
-                choice == 3 ? "SELECTED" : "Left-click to select this kit.", "Right-click to edit this kit.");
-        // (Selected kit keeps its enchant glint below; right-click still edits it too.)
-
-        ItemStack selectedItem = choice == 1 ? kit1 : (choice == 2 ? kit2 : kit3);
-        ItemMeta meta = selectedItem.getItemMeta();
-        if (meta != null) {
-            meta.addEnchant(Enchantment.UNBREAKING, 1, true);
-            meta.addItemFlags(ItemFlag.HIDE_ENCHANTS);
-            selectedItem.setItemMeta(meta);
+        for (int i = 12; i < 18; i++) {
+            inv.setItem(i, createGuiItem(Material.GRAY_STAINED_GLASS_PANE, Component.text(" ")));
         }
-
-        inv.setItem(11, kit1);
-        inv.setItem(13, kit2);
-        inv.setItem(15, kit3);
         inv.setItem(22, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
+
         player.openInventory(inv);
+    }
+
+    /** Sub-screen for kit metadata: rename, team, max players, and player selection. */
+    private void openKitTogglesGUI(Player player) {
+        UUID ownerId = player.getUniqueId();
+        String kitId = editingKitId.get(ownerId);
+
+        Inventory inv = Bukkit.createInventory(null, 27, Component.text("Kit Toggles").color(NamedTextColor.DARK_GRAY));
+
+        inv.setItem(10, createGuiItem(Material.FEATHER, Component.text("Rename").color(NamedTextColor.AQUA),
+                "Name: " + getKitName(ownerId, kitId), "Click to type a new name in chat."));
+
+        String team = getKitTeam(ownerId, kitId);
+        Material teamMat = team.equals(UNIVERSAL_TEAM) ? Material.WHITE_WOOL : EventTeam.valueOf(team).getWool();
+        NamedTextColor teamColor = team.equals(UNIVERSAL_TEAM) ? NamedTextColor.WHITE : EventTeam.valueOf(team).getScoreboardColor();
+        inv.setItem(12, createGuiItem(teamMat, Component.text("Team: " + (team.equals(UNIVERSAL_TEAM) ? "Universal" : team)).color(teamColor),
+                "Click to cycle: Universal -> Red -> Blue", "-> Green -> Yellow -> Universal."));
+
+        int maxPlayers = getKitMaxPlayers(ownerId, kitId);
+        inv.setItem(14, createGuiItem(Material.HOPPER, Component.text("Max Players: " + (maxPlayers <= 0 ? "Unlimited" : String.valueOf(maxPlayers))).color(NamedTextColor.YELLOW),
+                "Caps how many players may pick this", "kit during the Kit Selection Phase.",
+                "Left-click: +1  Right-click: -1  (0 = Unlimited)"));
+
+        boolean selectable = getKitSelectable(ownerId, kitId);
+        Material selMat = selectable ? Material.LIME_DYE : Material.GRAY_DYE;
+        NamedTextColor selColor = selectable ? NamedTextColor.GREEN : NamedTextColor.RED;
+        inv.setItem(16, createGuiItem(selMat, Component.text("Player Selection: " + (selectable ? "Enabled" : "Disabled")).color(selColor),
+                "Whether this kit appears in the", "in-match Kit Selection Phase menu.", "Click to toggle."));
+
+        inv.setItem(22, createGuiItem(Material.ARROW, Component.text("Back").color(NamedTextColor.GRAY)));
+
+        player.openInventory(inv);
+    }
+
+    /** Snapshots the main editor's armor/icon/inventory slots into the staging buffer before navigating away. */
+    private void captureMasterEditor(Player player, Inventory inv) {
+        UUID ownerId = player.getUniqueId();
+        ItemStack[] stage = kitBuilderStage.computeIfAbsent(ownerId, k -> new ItemStack[54]);
+        stage[0] = plainOrNull(inv.getItem(0), HELMET_PLACEHOLDER);
+        stage[1] = plainOrNull(inv.getItem(1), CHESTPLATE_PLACEHOLDER);
+        stage[2] = plainOrNull(inv.getItem(2), LEGGINGS_PLACEHOLDER);
+        stage[3] = plainOrNull(inv.getItem(3), BOOTS_PLACEHOLDER);
+        stage[4] = plainOrNull(inv.getItem(4), OFFHAND_PLACEHOLDER);
+        kitBuilderIcon.put(ownerId, plainOrNull(inv.getItem(5), ICON_PLACEHOLDER));
+        for (int i = 0; i < 36; i++) {
+            stage[18 + i] = inv.getItem(9 + i);
+        }
+    }
+
+    /** Snapshots the potions sub-screen's 12 slots into the staging buffer before navigating away. */
+    private void capturePotionsEditor(Player player, Inventory inv) {
+        UUID ownerId = player.getUniqueId();
+        ItemStack[] stage = kitBuilderStage.computeIfAbsent(ownerId, k -> new ItemStack[54]);
+        for (int i = 0; i < 12; i++) {
+            stage[5 + i] = plainOrNull(inv.getItem(i), POTION_PLACEHOLDER);
+        }
+    }
+
+    /** Persists the currently-open main editor's contents (plus whatever's staged for potions) as the kit's saved contents. Sends exactly one confirmation message. */
+    private void saveKitFromGUI(Player player, Inventory gui, String kitId) {
+        UUID ownerId = player.getUniqueId();
+        ItemStack[] stage = kitBuilderStage.computeIfAbsent(ownerId, k -> new ItemStack[54]);
+
+        List<ItemStack> kitToSave = new ArrayList<>(Collections.nCopies(54, null));
+        kitToSave.set(0, plainOrNull(gui.getItem(0), HELMET_PLACEHOLDER));
+        kitToSave.set(1, plainOrNull(gui.getItem(1), CHESTPLATE_PLACEHOLDER));
+        kitToSave.set(2, plainOrNull(gui.getItem(2), LEGGINGS_PLACEHOLDER));
+        kitToSave.set(3, plainOrNull(gui.getItem(3), BOOTS_PLACEHOLDER));
+        kitToSave.set(4, plainOrNull(gui.getItem(4), OFFHAND_PLACEHOLDER));
+        for (int i = 0; i < 12; i++) kitToSave.set(5 + i, stage[5 + i]);
+        for (int i = 0; i < 36; i++) kitToSave.set(18 + i, gui.getItem(9 + i));
+
+        ItemStack iconItem = plainOrNull(gui.getItem(5), ICON_PLACEHOLDER);
+
+        kitsDb.set(kitBase(ownerId, kitId) + "contents", kitToSave);
+        kitsDb.set(kitBase(ownerId, kitId) + "iconItem", iconItem);
+        saveKitsDatabase();
+        player.sendMessage(Component.text(getKitName(ownerId, kitId) + " saved!").color(NamedTextColor.GREEN));
+    }
+
+    private String cycleKitTeam(String current) {
+        List<String> order = List.of(UNIVERSAL_TEAM, "RED", "BLUE", "GREEN", "YELLOW");
+        int idx = order.indexOf(current);
+        return order.get((idx + 1) % order.size());
     }
 
     // ---------- Spawns menu ----------
@@ -1196,7 +1701,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             e.setCancelled(true);
             if (e.getRawSlot() == 10) openTeamsMenuGUI(player);
             else if (e.getRawSlot() == 12) openSpawnsMenuGUI(player);
-            else if (e.getRawSlot() == 14) openPlayerKitChoiceGUI(player);
+            else if (e.getRawSlot() == 14) openAdminKitsGUI(player, 0);
             else if (e.getRawSlot() == 16) openGameOptionsGUI(player);
             else if (e.getRawSlot() == 22) {
                 player.closeInventory();
@@ -1239,7 +1744,7 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 saveConfig();
                 openGameOptionsGUI(player);
             } else if (e.getRawSlot() == 15) {
-                inventoryManagementSeconds = cycleTime(inventoryManagementSeconds);
+                inventoryManagementSeconds = cycleInventoryManagementTime(inventoryManagementSeconds);
                 getConfig().set("settings.inventory-management-time", inventoryManagementSeconds);
                 saveConfig();
                 openGameOptionsGUI(player);
@@ -1269,7 +1774,47 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                 getConfig().set("settings.drop-items-on-death", dropItemsOnDeath);
                 saveConfig();
                 openGameOptionsGUI(player);
-            } else if (e.getRawSlot() == 26) {
+            } else if (e.getRawSlot() == 23) {
+                maxLives = cycleLives(maxLives, e.getClick().isRightClick() ? -1 : 1);
+                getConfig().set("settings.max-lives", maxLives);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 28) {
+                mobGriefingEnabled = !mobGriefingEnabled;
+                getConfig().set("settings.mob-griefing", mobGriefingEnabled);
+                saveConfig();
+                applyGameRule(GameRule.MOB_GRIEFING, mobGriefingEnabled);
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 29) {
+                daylightCycleEnabled = !daylightCycleEnabled;
+                getConfig().set("settings.daylight-cycle", daylightCycleEnabled);
+                saveConfig();
+                applyGameRule(GameRule.DO_DAYLIGHT_CYCLE, daylightCycleEnabled);
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 30) {
+                mobSpawningEnabled = !mobSpawningEnabled;
+                getConfig().set("settings.mob-spawning", mobSpawningEnabled);
+                saveConfig();
+                applyGameRule(GameRule.DO_MOB_SPAWNING, mobSpawningEnabled);
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 31) {
+                weatherCycleEnabled = !weatherCycleEnabled;
+                getConfig().set("settings.weather-cycle", weatherCycleEnabled);
+                saveConfig();
+                applyGameRule(GameRule.DO_WEATHER_CYCLE, weatherCycleEnabled);
+                if (!weatherCycleEnabled) {
+                    for (World world : Bukkit.getWorlds()) {
+                        world.setStorm(false);
+                        world.setThundering(false);
+                    }
+                }
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 32) {
+                lingeringSmokeGrenadesEnabled = !lingeringSmokeGrenadesEnabled;
+                getConfig().set("settings.lingering-smoke-grenades", lingeringSmokeGrenadesEnabled);
+                saveConfig();
+                openGameOptionsGUI(player);
+            } else if (e.getRawSlot() == 40) {
                 openMainGUI(player);
             }
         }
@@ -1346,9 +1891,21 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
             }
         }
         else if (title.startsWith("Master Kit Creator")) {
-            if (e.getRawSlot() >= 0 && e.getRawSlot() < 17) {
+            UUID ownerId = player.getUniqueId();
+            String kitId = editingKitId.get(ownerId);
+            int slot = e.getRawSlot();
+
+            if (slot == 0 || slot == 1 || slot == 2 || slot == 3 || slot == 4 || slot == 5) {
+                Material placeholder = switch (slot) {
+                    case 0 -> HELMET_PLACEHOLDER;
+                    case 1 -> CHESTPLATE_PLACEHOLDER;
+                    case 2 -> LEGGINGS_PLACEHOLDER;
+                    case 3 -> BOOTS_PLACEHOLDER;
+                    case 4 -> OFFHAND_PLACEHOLDER;
+                    default -> ICON_PLACEHOLDER;
+                };
                 ItemStack clicked = e.getCurrentItem();
-                if (clicked != null && clicked.getType().name().endsWith("GLASS_PANE")) {
+                if (clicked != null && clicked.getType() == placeholder) {
                     e.setCancelled(true);
                     ItemStack cursorItem = e.getCursor();
                     if (cursorItem != null && cursorItem.getType() != Material.AIR) {
@@ -1356,31 +1913,142 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
                         e.getView().setCursor(null);
                     }
                 }
+                return;
             }
 
-            if (e.getRawSlot() == 17) {
+            if (slot == 6) {
                 e.setCancelled(true);
-                int kitNumber = editingKitNumber.getOrDefault(player.getUniqueId(), 1);
-                saveKitFromGUI(player, e.getInventory(), kitNumber);
+                if (kitId == null) return;
+                captureMasterEditor(player, e.getInventory());
+                kitEditorInternalNav.add(ownerId);
+                openKitPotionsGUI(player);
+            } else if (slot == 7) {
+                e.setCancelled(true);
+                if (kitId == null) return;
+                captureMasterEditor(player, e.getInventory());
+                kitEditorInternalNav.add(ownerId);
+                openKitTogglesGUI(player);
+            } else if (slot == 8) {
+                e.setCancelled(true);
+                if (kitId == null) return;
+                saveKitFromGUI(player, e.getInventory(), kitId);
                 player.closeInventory();
-                Bukkit.getScheduler().runTask(this, () -> openPlayerKitChoiceGUI(player));
+                Bukkit.getScheduler().runTask(this, () -> openAdminKitsGUI(player, kitListPage.getOrDefault(ownerId, 0)));
+            } else if (slot == 53) {
+                e.setCancelled(true);
+                player.closeInventory();
+                Bukkit.getScheduler().runTask(this, () -> openAdminKitsGUI(player, kitListPage.getOrDefault(ownerId, 0)));
+            } else if (slot >= 45 && slot < 53) {
+                e.setCancelled(true);
+            }
+            // slots 9-44 (the 36-slot inventory area): left uncancelled for free drag-and-drop editing.
+        }
+        else if (title.equals("Kit Potion Effects")) {
+            UUID ownerId = player.getUniqueId();
+            String kitId = editingKitId.get(ownerId);
+            int slot = e.getRawSlot();
+
+            if (slot >= 0 && slot < 12) {
+                ItemStack clicked = e.getCurrentItem();
+                if (clicked != null && clicked.getType() == POTION_PLACEHOLDER) {
+                    e.setCancelled(true);
+                    ItemStack cursorItem = e.getCursor();
+                    if (cursorItem != null && cursorItem.getType() != Material.AIR) {
+                        e.setCurrentItem(cursorItem.clone());
+                        e.getView().setCursor(null);
+                    }
+                }
+                return;
+            }
+
+            if (slot == 22) {
+                e.setCancelled(true);
+                if (kitId == null) return;
+                capturePotionsEditor(player, e.getInventory());
+                kitEditorInternalNav.add(ownerId);
+                openMasterKitEditorGUI(player);
+            } else if (slot >= 12 && slot < 27) {
+                e.setCancelled(true);
             }
         }
-        else if (title.equals("My Kits")) {
+        else if (title.equals("Kit Toggles")) {
             e.setCancelled(true);
-            int kitNumber = e.getRawSlot() == 11 ? 1 : e.getRawSlot() == 13 ? 2 : e.getRawSlot() == 15 ? 3 : 0;
-            if (kitNumber != 0) {
-                if (e.getClick().isRightClick()) {
-                    openMasterKitEditorGUI(player, kitNumber);
-                } else {
-                    kitsDb.set("playerkits." + player.getUniqueId() + ".choice", kitNumber);
-                    saveKitsDatabase();
-                    player.sendMessage(Component.text("You selected Kit " + kitNumber + "!").color(NamedTextColor.GREEN));
-                    openPlayerKitChoiceGUI(player);
-                }
-            } else if (e.getRawSlot() == 22) {
-                openMainGUI(player);
+            UUID ownerId = player.getUniqueId();
+            String kitId = editingKitId.get(ownerId);
+            if (kitId == null) return;
+            int slot = e.getRawSlot();
+
+            if (slot == 10) {
+                kitEditorInternalNav.add(ownerId);
+                awaitingKitNameInput.put(ownerId, kitId);
+                player.closeInventory();
+                player.sendMessage(Component.text("Type the new name for this kit in chat (or type 'cancel').").color(NamedTextColor.AQUA));
+            } else if (slot == 12) {
+                String newTeam = cycleKitTeam(getKitTeam(ownerId, kitId));
+                kitsDb.set(kitBase(ownerId, kitId) + "team", newTeam);
+                saveKitsDatabase();
+                openKitTogglesGUI(player);
+            } else if (slot == 14) {
+                int current = getKitMaxPlayers(ownerId, kitId);
+                int updated = current + (e.getClick().isRightClick() ? -1 : 1);
+                if (updated < 0) updated = 0;
+                if (updated > 64) updated = 64;
+                kitsDb.set(kitBase(ownerId, kitId) + "maxPlayers", updated);
+                saveKitsDatabase();
+                openKitTogglesGUI(player);
+            } else if (slot == 16) {
+                boolean updated = !getKitSelectable(ownerId, kitId);
+                kitsDb.set(kitBase(ownerId, kitId) + "selectable", updated);
+                saveKitsDatabase();
+                openKitTogglesGUI(player);
+            } else if (slot == 22) {
+                kitEditorInternalNav.add(ownerId);
+                openMasterKitEditorGUI(player);
             }
+        }
+        else if (title.equals("Admin Kits")) {
+            e.setCancelled(true);
+            UUID ownerId = player.getUniqueId();
+            int page = kitListPage.getOrDefault(ownerId, 0);
+            List<String> ids = getKitIds(ownerId);
+
+            if (e.getRawSlot() == 45 && page > 0) {
+                openAdminKitsGUI(player, page - 1);
+            } else if (e.getRawSlot() == 46) {
+                String newId = createNewKit(ownerId);
+                player.sendMessage(Component.text("Created " + getKitName(ownerId, newId) + "!").color(NamedTextColor.GREEN));
+                openAdminKitsGUI(player, page);
+            } else if (e.getRawSlot() == 49) {
+                kitSelectionPhaseEnabled = !kitSelectionPhaseEnabled;
+                getConfig().set("settings.kit-selection-phase", kitSelectionPhaseEnabled);
+                if (kitSelectionPhaseEnabled && inventoryManagementSeconds <= 0) {
+                    inventoryManagementSeconds = 5;
+                    getConfig().set("settings.inventory-management-time", inventoryManagementSeconds);
+                }
+                saveConfig();
+                openAdminKitsGUI(player, page);
+            } else if (e.getRawSlot() == 52) {
+                openAdminKitsGUI(player, page + 1);
+            } else if (e.getRawSlot() == 53) {
+                openMainGUI(player);
+            } else if (e.getRawSlot() >= 0 && e.getRawSlot() < 45) {
+                int index = page * 45 + e.getRawSlot();
+                if (index < ids.size()) {
+                    String kitId = ids.get(index);
+                    if (e.getClick().isRightClick()) {
+                        beginEditingKit(player, kitId);
+                    } else {
+                        kitsDb.set("playerkits." + ownerId + ".choice", kitId);
+                        saveKitsDatabase();
+                        player.sendMessage(Component.text("You selected " + getKitName(ownerId, kitId) + " as your default kit!").color(NamedTextColor.GREEN));
+                        openAdminKitsGUI(player, page);
+                    }
+                }
+            }
+        }
+        else if (title.equals("Choose Your Kit")) {
+            e.setCancelled(true);
+            handleKitSelectionClick(player, e.getRawSlot());
         }
         else if (title.equals("Spawn Setup")) {
             e.setCancelled(true);
@@ -1413,11 +2081,39 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         if (!(e.getPlayer() instanceof Player player)) return;
         String title = PlainTextComponentSerializer.plainText().serialize(e.getView().title());
 
-        if (title.startsWith("Master Kit Creator") && savedKitBuilderInventories.containsKey(player.getUniqueId())) {
-            player.setGameMode(savedKitBuilderGameModes.get(player.getUniqueId()));
-            player.getInventory().setContents(savedKitBuilderInventories.get(player.getUniqueId()));
-            savedKitBuilderInventories.remove(player.getUniqueId());
-            savedKitBuilderGameModes.remove(player.getUniqueId());
+        boolean isKitEditorScreen = title.startsWith("Master Kit Creator") || title.equals("Kit Potion Effects") || title.equals("Kit Toggles");
+        if (isKitEditorScreen) {
+            UUID ownerId = player.getUniqueId();
+            if (!kitEditorInternalNav.remove(ownerId) && savedKitBuilderInventories.containsKey(ownerId)) {
+                // Truly leaving kit editing (not just hopping to a sub-screen): restore the
+                // admin's real inventory/gamemode and discard any in-progress kit builder state.
+                player.setGameMode(savedKitBuilderGameModes.get(ownerId));
+                player.getInventory().setContents(savedKitBuilderInventories.get(ownerId));
+                savedKitBuilderInventories.remove(ownerId);
+                savedKitBuilderGameModes.remove(ownerId);
+                kitBuilderStage.remove(ownerId);
+                kitBuilderIcon.remove(ownerId);
+                editingKitId.remove(ownerId);
+            }
+        }
+
+        if (title.equals("Choose Your Kit")) {
+            UUID id = player.getUniqueId();
+            kitSelectionGuiOpenPlayers.remove(id);
+
+            // If the selection phase is still actively running for this player (they're
+            // still frozen/invincible in it, haven't been given a kit yet), closing the
+            // GUI (Esc, clicking off, etc.) should not let them dodge picking a kit -
+            // pop it back open next tick. Once the phase actually ends for them,
+            // frozenPlayers no longer contains their id, so this naturally stops.
+            if (kitSelectionPhaseActive && eventRunning && isParticipant(id) && frozenPlayers.contains(id)) {
+                Bukkit.getScheduler().runTask(this, () -> {
+                    if (kitSelectionPhaseActive && eventRunning && isParticipant(id) && frozenPlayers.contains(id)
+                            && player.isOnline()) {
+                        openKitSelectionGUI(player);
+                    }
+                });
+            }
         }
     }
 
@@ -1784,37 +2480,57 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
     // Team & Game Interactions
     // ==========================================
 
-    private static final int TOTAL_KITS = 3;
+    private UUID currentKitOwnerId() {
+        return eventHostId != null ? eventHostId : null;
+    }
 
     /**
-     * Tries the chosen kit first, then cycles through the remaining kit slots
-     * (in order) looking for the first one that has actually been built (54
-     * saved slots) among the owner's 3 personal kits, so nobody ends up
-     * empty-handed just because the preferred kit hasn't been designed yet.
-     * "kitOwnerId" is whoever's kit selection is being used - see giveKit().
+     * Tries the chosen kit id first, then cycles through the owner's other
+     * kit ids (in list order) looking for the first one that has actually
+     * been built (54 saved slots), so nobody ends up empty-handed just
+     * because the preferred kit hasn't been designed yet.
      */
-    private List<ItemStack> resolveKitContents(UUID kitOwnerId, int choice) {
-        for (int attempt = 0; attempt < TOTAL_KITS; attempt++) {
-            int kitNum = ((choice - 1 + attempt) % TOTAL_KITS) + 1;
-            @SuppressWarnings("unchecked")
-            List<ItemStack> kit = (List<ItemStack>) kitsDb.getList("playerkits." + kitOwnerId + ".kit" + kitNum);
-            if (kit != null && kit.size() == 54) return kit;
+    private List<ItemStack> resolveKitContentsById(UUID kitOwnerId, String preferredKitId) {
+        List<String> ids = getKitIds(kitOwnerId);
+        if (ids.isEmpty()) return null;
+
+        if (preferredKitId != null && isKitBuilt(kitOwnerId, preferredKitId)) {
+            return getKitContents(kitOwnerId, preferredKitId);
+        }
+        for (String id : ids) {
+            if (isKitBuilt(kitOwnerId, id)) return getKitContents(kitOwnerId, id);
+        }
+        return null;
+    }
+
+    /** Returns the kit id actually used (for tracking/respawns), or null if nothing was built. */
+    private String resolvedKitId(UUID kitOwnerId, String preferredKitId) {
+        List<String> ids = getKitIds(kitOwnerId);
+        if (preferredKitId != null && isKitBuilt(kitOwnerId, preferredKitId)) return preferredKitId;
+        for (String id : ids) {
+            if (isKitBuilt(kitOwnerId, id)) return id;
         }
         return null;
     }
 
     /**
-     * Everyone in the match uses the host's kit - the kit belonging to
-     * whoever clicked "Start" (eventHostId) - EXCEPT the host themself, who
-     * of course still uses their own. Players still build and choose among
-     * their own 3 kits in "My Kits"; that selection only actually gets
-     * equipped when they are hosting the event.
+     * Everyone in the match uses the host's kit library - whoever clicked
+     * "Start" (eventHostId) - EXCEPT the host themself, who of course still
+     * uses their own library. Players still build kits in "Admin Kits";
+     * that library only actually gets used when they are hosting (or,
+     * during a Kit Selection Phase, when the host approves specific
+     * kits for everyone to pick from).
      */
     private void giveKit(Player player) {
-        UUID playerId = player.getUniqueId();
-        UUID kitOwnerId = (eventHostId != null) ? eventHostId : playerId;
-        int choice = kitsDb.getInt("playerkits." + kitOwnerId + ".choice", 1);
-        List<ItemStack> kitContents = resolveKitContents(kitOwnerId, choice);
+        UUID kitOwnerId = (eventHostId != null) ? eventHostId : player.getUniqueId();
+        String choice = kitsDb.getString("playerkits." + kitOwnerId + ".choice", null);
+        giveKitById(player, kitOwnerId, choice);
+    }
+
+    private void giveKitById(Player player, UUID kitOwnerId, String preferredKitId) {
+        String resolvedId = resolvedKitId(kitOwnerId, preferredKitId);
+        List<ItemStack> kitContents = resolveKitContentsById(kitOwnerId, preferredKitId);
+        assignedKitId.put(player.getUniqueId(), resolvedId);
 
         if (kitContents != null && kitContents.size() == 54) {
             player.getInventory().clear();
@@ -1850,9 +2566,197 @@ public class CustomTeamsPlugin extends JavaPlugin implements Listener, CommandEx
         }
     }
 
+    // ==========================================
+    // Player Kit Selection Phase
+    // ==========================================
+
+    /** Kits from the host's library that are admin-approved and available to this participant. */
+    private List<String> getApprovedKitsFor(UUID kitOwnerId, Player participant) {
+        List<String> result = new ArrayList<>();
+        List<String> ids = getKitIds(kitOwnerId);
+        EventTeam team = playerTeams.get(participant.getUniqueId());
+
+        for (String id : ids) {
+            if (!getKitSelectable(kitOwnerId, id)) continue;
+            String kitTeam = getKitTeam(kitOwnerId, id);
+            boolean teamMatches = currentMode == EventMode.FFA
+                    || kitTeam.equals(UNIVERSAL_TEAM)
+                    || (team != null && kitTeam.equals(team.name()));
+            if (teamMatches) result.add(id);
+        }
+        return result;
+    }
+
+    /** How many current match participants have this kit selected right now. */
+    private int countKitSelections(String kitId) {
+        int count = 0;
+        for (String chosen : kitSelectionChoice.values()) {
+            if (kitId.equals(chosen)) count++;
+        }
+        return count;
+    }
+
+    private boolean kitSelectionPhaseApplies() {
+        if (!kitSelectionPhaseEnabled) return false;
+        UUID kitOwnerId = currentKitOwnerId();
+        if (kitOwnerId == null) return false;
+        for (String id : getKitIds(kitOwnerId)) {
+            if (getKitSelectable(kitOwnerId, id)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Freezes/protects participants (same as the plain inventory-management
+     * window) and opens each of them the "Choose Your Kit" GUI, filtered to
+     * admin-approved kits for their team (or all approved kits in FFA).
+     * Teammates can see each other's live picks via refreshKitSelectionGuis().
+     * When the timer expires, everyone receives their chosen kit (or the
+     * first available approved kit if they never picked one).
+     */
+    private void beginKitSelectionPhase(List<Player> participants) {
+        kitSelectionPhaseActive = true;
+        UUID kitOwnerId = currentKitOwnerId();
+
+        for (Player p : participants) {
+            UUID id = p.getUniqueId();
+            frozenPlayers.add(id);
+            invinciblePlayers.add(id);
+            kitSelectionChoice.remove(id);
+            p.showTitle(Title.title(
+                    Component.text("Choose Your Kit!").color(NamedTextColor.AQUA).decorate(TextDecoration.BOLD),
+                    Component.text("The match begins in " + inventoryManagementSeconds + " seconds...").color(NamedTextColor.GRAY)));
+            openKitSelectionGUI(p);
+        }
+
+        kitSelectionTimerTask = Bukkit.getScheduler().runTaskLater(this, () -> {
+            for (Player p : participants) {
+                UUID id = p.getUniqueId();
+                frozenPlayers.remove(id);
+                invinciblePlayers.remove(id);
+                kitSelectionGuiOpenPlayers.remove(id);
+                p.closeInventory();
+
+                String chosen = kitSelectionChoice.get(id);
+                if (chosen == null) {
+                    List<String> approved = getApprovedKitsFor(kitOwnerId != null ? kitOwnerId : id, p);
+                    if (!approved.isEmpty()) chosen = approved.get(0);
+                }
+                giveKitById(p, kitOwnerId != null ? kitOwnerId : id, chosen);
+
+                p.sendMessage(Component.text("\n\n★ THE EVENT HAS STARTED! ★\n\n").color(NamedTextColor.GOLD).decorate(TextDecoration.BOLD));
+                p.showTitle(Title.title(Component.text("FIGHT!").color(NamedTextColor.RED).decorate(TextDecoration.BOLD), Component.empty()));
+                grantInvincibility(p, spawnInvincibilitySeconds);
+            }
+            kitSelectionChoice.clear();
+            kitSelectionPhaseActive = false;
+            kitSelectionTimerTask = null;
+        }, inventoryManagementSeconds * 20L);
+    }
+
+    private void openKitSelectionGUI(Player player) {
+        UUID kitOwnerId = currentKitOwnerId();
+        if (kitOwnerId == null) kitOwnerId = player.getUniqueId();
+        List<String> approved = getApprovedKitsFor(kitOwnerId, player);
+
+        Inventory inv = Bukkit.createInventory(null, 54, Component.text("Choose Your Kit").color(NamedTextColor.DARK_GRAY));
+        String myChoice = kitSelectionChoice.get(player.getUniqueId());
+        EventTeam myTeam = playerTeams.get(player.getUniqueId());
+
+        int slot = 0;
+        for (String id : approved) {
+            if (slot >= 45) break;
+            UUID finalOwner = kitOwnerId;
+            int selectedCount = countKitSelections(id);
+            int maxPlayers = getKitMaxPlayers(finalOwner, id);
+            boolean full = maxPlayers > 0 && selectedCount >= maxPlayers && !id.equals(myChoice);
+
+            List<String> lore = new ArrayList<>();
+            lore.add("Team: " + (getKitTeam(finalOwner, id).equals(UNIVERSAL_TEAM) ? "Universal" : getKitTeam(finalOwner, id)));
+            lore.add("Slots: " + (maxPlayers <= 0 ? (selectedCount + " picking / Unlimited") : (selectedCount + " / " + maxPlayers)));
+
+            List<String> teammatePicks = new ArrayList<>();
+            for (Map.Entry<UUID, String> entry : kitSelectionChoice.entrySet()) {
+                if (!id.equals(entry.getValue())) continue;
+                if (currentMode == EventMode.TEAMS && myTeam != null && playerTeams.get(entry.getKey()) != myTeam) continue;
+                Player teammate = Bukkit.getPlayer(entry.getKey());
+                if (teammate != null) teammatePicks.add(teammate.getName());
+            }
+            if (!teammatePicks.isEmpty()) lore.add("Picking: " + String.join(", ", teammatePicks));
+
+            if (id.equals(myChoice)) lore.add("SELECTED");
+            else if (full) lore.add("FULL");
+            else lore.add("Click to select this kit.");
+
+            ItemStack item = renderKitDisplayItem(getKitIconItem(finalOwner, id), Component.text(getKitName(finalOwner, id)).color(full ? NamedTextColor.DARK_GRAY : NamedTextColor.GOLD), lore.toArray(new String[0]));
+            if (id.equals(myChoice)) {
+                ItemMeta meta = item.getItemMeta();
+                if (meta != null) {
+                    meta.addEnchant(Enchantment.UNBREAKING, 1, true);
+                    meta.addItemFlags(ItemFlag.HIDE_ENCHANTS);
+                    item.setItemMeta(meta);
+                }
+            }
+            inv.setItem(slot++, item);
+        }
+
+        player.openInventory(inv);
+        kitSelectionGuiOpenPlayers.add(player.getUniqueId());
+    }
+
+    private void handleKitSelectionClick(Player player, int rawSlot) {
+        UUID kitOwnerId = currentKitOwnerId();
+        if (kitOwnerId == null) kitOwnerId = player.getUniqueId();
+        List<String> approved = getApprovedKitsFor(kitOwnerId, player);
+        if (rawSlot < 0 || rawSlot >= approved.size()) return;
+
+        String kitId = approved.get(rawSlot);
+        int maxPlayers = getKitMaxPlayers(kitOwnerId, kitId);
+        int selectedCount = countKitSelections(kitId);
+        boolean alreadyMine = kitId.equals(kitSelectionChoice.get(player.getUniqueId()));
+
+        if (!alreadyMine && maxPlayers > 0 && selectedCount >= maxPlayers) {
+            player.sendMessage(Component.text("That kit is full!").color(NamedTextColor.RED));
+            return;
+        }
+
+        kitSelectionChoice.put(player.getUniqueId(), kitId);
+        player.sendMessage(Component.text("You are now picking: " + getKitName(kitOwnerId, kitId)).color(NamedTextColor.GREEN));
+        refreshKitSelectionGuis();
+    }
+
+    /** Live-refreshes the "Choose Your Kit" GUI for every participant who currently has it open. */
+    private void refreshKitSelectionGuis() {
+        for (UUID id : new ArrayList<>(kitSelectionGuiOpenPlayers)) {
+            Player p = Bukkit.getPlayer(id);
+            if (p != null && p.isOnline()) openKitSelectionGUI(p);
+        }
+    }
+
     @EventHandler
     public void onChat(AsyncChatEvent e) {
         UUID id = e.getPlayer().getUniqueId();
+
+        if (awaitingKitNameInput.containsKey(id)) {
+            e.setCancelled(true);
+            String kitId = awaitingKitNameInput.remove(id);
+            String typed = PlainTextComponentSerializer.plainText().serialize(e.message()).trim();
+            Player player = e.getPlayer();
+
+            Bukkit.getScheduler().runTask(this, () -> {
+                if (!typed.equalsIgnoreCase("cancel") && !typed.isEmpty()) {
+                    String finalName = typed.length() > 32 ? typed.substring(0, 32) : typed;
+                    kitsDb.set(kitBase(id, kitId) + "name", finalName);
+                    saveKitsDatabase();
+                    player.sendMessage(Component.text("Kit renamed to \"" + finalName + "\"!").color(NamedTextColor.GREEN));
+                } else {
+                    player.sendMessage(Component.text("Rename cancelled.").color(NamedTextColor.YELLOW));
+                }
+                openKitTogglesGUI(player);
+            });
+            return;
+        }
+
         boolean participant = eventRunning && isParticipant(id);
         NamedTextColor color = participant ? getParticipantColor(id) : null;
 
