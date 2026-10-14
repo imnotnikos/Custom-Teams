@@ -1,4 +1,6 @@
-<img width="100" height="100" alt="CustomTeamsLogo" src="https://github.com/user-attachments/assets/706d3259-4de1-4fdc-982f-e7d3656b077e" /> 
+<p align="center"><img src="assets/social-preview.png" alt="Custom Teams banner" width="100%"></p>
+
+<img src="assets/icon.png" width="100" height="100" alt="Custom Teams icon" />
 
 # Custom Teams - Paper 1.21.11 Plugin
 
